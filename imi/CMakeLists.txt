@@ -1,5 +1,5 @@
-# imi.cpp: an engine built for Seoul (LFM3-Omni) alone. Our own design (graphs, caches, frame loop, pipeline);
-# the innermost math loops come from ggml for now and are replaced one at a time when ours is faster on the floor box.
+# imi.cpp: an engine built for Seoul (LFM3-Omni) alone, from scratch: our own thread team, table layouts, kernels,
+# step loops and pipeline. ggml is only the GGUF file reader (core/); brain.cpp is the first try on ggml's graph.
 cmake_minimum_required(VERSION 3.16)
 project(imi CXX C)
 set(CMAKE_CXX_STANDARD 17)
@@ -26,3 +26,7 @@ target_link_libraries(imi-gen PRIVATE ggml ggml-cpu)
 add_executable(imi-brain-check brain_check.cpp brain.cpp model.cpp kernels/q4x8.cpp)
 target_include_directories(imi-brain-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(imi-brain-check PRIVATE ggml ggml-cpu)
+add_executable(imi-seoul-check core/seoul_check.cpp core/seoul.cpp core/tables.cpp model.cpp)
+target_include_directories(imi-seoul-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(imi-seoul-check PRIVATE cxx_std_20)
+target_link_libraries(imi-seoul-check PRIVATE ggml ggml-cpu)
