@@ -22,7 +22,14 @@ body.ko .s .ko{display:block}.s.old .en{color:var(--dim)}.s.writing .en{opacity:
 #empty{color:var(--dim);padding:40px 0;text-align:center}
 footer{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;justify-content:center;padding:12px;padding-bottom:max(12px,env(safe-area-inset-bottom));background:linear-gradient(transparent,var(--bg) 30%)}
 #jump{position:fixed;right:16px;bottom:80px;display:none}
+#start{position:fixed;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--bg)}
+#start .box{max-width:340px;width:100%;text-align:center}#start .box>b{display:block;font-size:26px;margin-bottom:2px}
+#start p{color:var(--dim);margin:0 0 22px}#start button{display:block;width:100%;padding:14px;margin:10px 0;font-size:18px}
+#start .note{font-size:14px;margin:18px 0 0}
 </style></head><body>
+<div id="start"><div class="box"><b>Nunchi</b><p>The sermon in English, live.</p>
+<button class="main" id="go-listen">🎧 Listen and read</button><button id="go-read">Read only</button>
+<p class="note">Your screen stays on while Nunchi is open.</p></div></div>
 <header><span id="dot"></span><b>Nunchi</b><span id="state">connecting…</span></header>
 <div id="lines"><div id="empty">The English appears here as he speaks.</div></div>
 <button id="jump" onclick="follow=true;down()">↓ Live</button>
@@ -49,14 +56,29 @@ function connect(){if(es)es.close();es=new EventSource('/events'+(audio?'?audio=
  es.addEventListener('en',e=>{const m=JSON.parse(e.data);show(m.id,m.en,m.ko,true)});
  es.addEventListener('w',e=>{const m=JSON.parse(e.data);show(m.id,m.en,null,false)});
  es.addEventListener('sp',e=>play(JSON.parse(e.data).d))}
-async function wake(){try{if('wakeLock' in navigator&&document.visibilityState==='visible')lock=await navigator.wakeLock.request('screen')}catch(e){}}
-document.addEventListener('visibilitychange',()=>{if(audio)wake();if(ctx&&document.visibilityState==='visible')ctx.resume()});
-document.getElementById('listen').onclick=async e=>{
- if(audio){audio=false;e.target.textContent='🎧 Listen';e.target.className='main';if(ctx)ctx.suspend();connect();return}
+// The screen stays on while the page is open: the browser's wake lock where it has one (https, localhost), else a tiny
+// silent video kept playing, since phones get this page over plain http on the room's Wi-Fi, where there is no wake
+// lock. iPhones stay awake only for a video that is in the page, playing, and moved back before its end (a looping
+// one does not count), and start one only from a tap: the start screen's.
+const AWAKE='data:video/mp4;base64,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';
+let awakeOn=false,awakeV=null;
+async function awake(){awakeOn=true;
+ if('wakeLock' in navigator){try{lock=await navigator.wakeLock.request('screen');return}catch(e){}}
+ if(!awakeV){const v=awakeV=document.createElement('video');v.setAttribute('playsinline','');v.setAttribute('title','Nunchi');
+  v.style.cssText='position:fixed;left:-10px;top:-10px;width:1px;height:1px;opacity:.01;pointer-events:none';v.src=AWAKE;
+  v.addEventListener('timeupdate',()=>{if(v.currentTime>1)v.currentTime=Math.random()*.5});document.body.appendChild(v)}
+ awakeV.play().catch(()=>{})}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState!=='visible')return;if(awakeOn)awake();if(ctx)ctx.resume()});
+const lb=document.getElementById('listen');
+async function listen(){
+ if(audio){audio=false;lb.textContent='🎧 Listen';lb.className='main';if(ctx)ctx.suspend();connect();return}
  try{if(navigator.audioSession)navigator.audioSession.type='playback'}catch(x){}
  ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();
  const b=ctx.createBuffer(1,1,24000),s=ctx.createBufferSource();s.buffer=b;s.connect(ctx.destination);s.start();
- next=0;audio=true;e.target.textContent='■ Stop voice';e.target.className='';wake();connect()};
+ next=0;audio=true;lb.textContent='■ Stop voice';lb.className='';connect()}
+lb.onclick=()=>{awake();listen()};
+document.getElementById('go-listen').onclick=()=>{awake();document.getElementById('start').remove();listen()};
+document.getElementById('go-read').onclick=()=>{awake();document.getElementById('start').remove()};
 document.getElementById('kob').onclick=()=>{document.body.classList.toggle('ko');localStorage.ko=document.body.classList.contains('ko')?'1':'0'};
 document.getElementById('sm').onclick=()=>{fs=Math.max(.9,fs-.15);localStorage.fs=fs;document.documentElement.style.setProperty('--fs',fs+'em')};
 document.getElementById('lg').onclick=()=>{fs=Math.min(2.6,fs+.15);localStorage.fs=fs;document.documentElement.style.setProperty('--fs',fs+'em')};
@@ -120,7 +142,10 @@ async function start(){
  setInterval(()=>{flush();const db=20*Math.log10(peak+1e-9);$('meter').firstChild.style.width=Math.max(0,Math.min(100,(db+60)/60*100))+'%';$('lvl').textContent=peak>0?Math.round(db)+' dB':'';peak=0},100);
  await api('/api/set?listening=1',{method:'POST'});on=true;$('go').textContent='■ Stop';$('go').className='stop';$('hint')?.remove()}
 async function stop(){on=false;await api('/api/set?listening=0',{method:'POST'});if(stream)stream.getTracks().forEach(t=>t.stop());if(ctx)ctx.close();ctx=null;$('go').textContent='▶ Start';$('go').className='go'}
-$('go').onclick=()=>on?stop():start().catch(e=>alert('The microphone could not start: '+e.message));
+// the computer's screen stays on while it translates (the page is on localhost, where browsers give a wake lock)
+let slock=null;async function stayOn(){try{if('wakeLock' in navigator&&document.visibilityState==='visible')slock=await navigator.wakeLock.request('screen')}catch(e){}}
+document.addEventListener('visibilitychange',()=>{if(on)stayOn()});
+$('go').onclick=()=>on?stop():(stayOn(),start().catch(e=>alert('The microphone could not start: '+e.message)));
 $('voice').onchange=()=>api('/api/set?voice='+($('voice').checked?1:0),{method:'POST'});
 $('proj').onclick=()=>{document.body.classList.toggle('proj');if(document.body.classList.contains('proj'))document.documentElement.requestFullscreen?.()};
 document.addEventListener('keydown',e=>{if(e.key==='Escape')document.body.classList.remove('proj')});

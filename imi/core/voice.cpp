@@ -27,12 +27,12 @@ void transpose(const float * a, int P, int K, int lda, float * t) {
 bool imi_voice::load(const std::string & path, int threads, imi_team * shared) {
     if (!f.load(path, false)) return false;
     const std::string g = "a.gen.code.";
-    embd      = f.get(g + "embd.weight");
-    out_embd  = f.get(g + "out_embd.weight");
-    mask_embd = f32(f.get(g + "mask_embd"));
-    out_norm  = f32(f.get(g + "output_norm.weight"));
-    head_norm = f32(f.get(g + "head_norm.weight"));
-    proj_b    = f32(f.get(g + "proj_in.bias"));
+    embd      = f.keep(g + "embd.weight");       // read while running: masked-pass inputs
+    out_embd  = f.keep(g + "out_embd.weight");   // read while running: the brain's next input
+    mask_embd = f32(f.keep(g + "mask_embd"));
+    out_norm  = f32(f.keep(g + "output_norm.weight"));
+    head_norm = f32(f.keep(g + "head_norm.weight"));
+    proj_b    = f32(f.keep(g + "proj_in.bias"));
     const ggml_tensor * pw = f.get(g + "proj_in.weight");
     n_embd = (int) embd->ne[0]; n_vocab = (int) embd->ne[1]; n_cb = (int) embd->ne[2]; n_in = (int) pw->ne[0];
     if (embd->type != GGML_TYPE_Q8_0) { fprintf(stderr, "imi-voice: needs the 8-bit generator file (genq8b)\n"); return false; }
@@ -48,8 +48,8 @@ bool imi_voice::load(const std::string & path, int threads, imi_team * shared) {
         const std::string p = g + "blk." + std::to_string(il) + ".";
         if (!f.get(p + "ln1.weight", false)) break;
         layer L;
-        L.ln1 = f32(f.get(p + "ln1.weight")); L.ln2 = f32(f.get(p + "ln2.weight"));
-        L.q_norm = f32(f.get(p + "attn_q_norm.weight")); L.k_norm = f32(f.get(p + "attn_k_norm.weight"));
+        L.ln1 = f32(f.keep(p + "ln1.weight")); L.ln2 = f32(f.keep(p + "ln2.weight"));
+        L.q_norm = f32(f.keep(p + "attn_q_norm.weight")); L.k_norm = f32(f.keep(p + "attn_k_norm.weight"));
         const ggml_tensor * q = f.get(p + "attn_q.weight"), * k = f.get(p + "attn_k.weight");
         head_dim = (int) f.get(p + "attn_q_norm.weight")->ne[0];
         n_head = (int) (q->ne[1] / head_dim); n_head_kv = (int) (k->ne[1] / head_dim);
@@ -72,6 +72,7 @@ bool imi_voice::load(const std::string & path, int threads, imi_team * shared) {
         bytes += score[c].bytes;
     }
     if (!ok) { fprintf(stderr, "imi-voice: a generator table is not 8-bit\n"); return false; }
+    f.drop_data();   // every other table is in our layout now
     n_qkv = (n_head + 2 * n_head_kv) * head_dim + n_head;
     n_threads = shared ? shared->n : threads;
     per.resize(n_threads);

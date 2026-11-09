@@ -77,7 +77,7 @@ bool imi_file::load(const std::string & path, bool repack) {
         ta = ggml_tallocr_new(repacked);
     }
 
-    FILE * f = fopen(path.c_str(), "rb");
+    FILE * f = ggml_fopen(path.c_str(), "rb");   // UTF-8 names, also on Windows (like gguf)
     if (!f) return false;
     const size_t off0 = gguf_get_data_offset(meta);
     auto read_at = [&](const ggml_tensor * t, void * dst) {
@@ -130,9 +130,42 @@ float imi_file::key_f(const std::string & name, float def) const {
     return k < 0 ? def : gguf_get_val_f32(meta, k);
 }
 
+// a tensor's bytes are in the file's block (not kept yet, not in the repacked buffer)
+static bool in_block(const ggml_tensor * t, const void * data, size_t size) {
+    return data && t->data && (const char *) t->data >= (const char *) data && (const char *) t->data < (const char *) data + size;
+}
+
+ggml_tensor * imi_file::keep(const std::string & name, bool required) {
+    ggml_tensor * t = get(name, required);
+    if (!t || !in_block(t, data, size)) return t;   // missing (and not required), or already its own
+    void * p = nullptr;
+    if (posix_memalign(&p, 64, GGML_PAD(ggml_nbytes(t), 64)) != 0) {
+        fprintf(stderr, "imi: out of memory keeping %s\n", t->name);
+        exit(1);
+    }
+    memcpy(p, t->data, ggml_nbytes(t));
+    t->data = p;
+    kept.push_back(p);
+    return t;
+}
+
+void imi_file::drop_data() {
+    if (!data) return;
+    size_t mine = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (in_block(t, data, size)) t->data = nullptr;
+        else if (t->data) mine += ggml_nbytes(t);
+    }
+    fprintf(stderr, "imi: %zu MB of the file let go, %zu MB kept\n", size >> 20, mine >> 20);
+    aligned_free(data);
+    data = nullptr;
+    size = 0;
+}
+
 imi_file::~imi_file() {
     if (ctx) ggml_free(ctx);
     if (meta) gguf_free(meta);
     if (repacked) ggml_backend_buffer_free(repacked);
     aligned_free(data);
+    for (void * p : kept) aligned_free(p);
 }

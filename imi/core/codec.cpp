@@ -42,11 +42,11 @@ void ifft_rec(const cf * in, int n, int stride, cf * out, const cf * tw, int tws
 bool imi_codec::load(const std::string & path, int threads, imi_team * shared) {
     if (!f.load(path, false)) return false;
     const std::string g = "a.gen.wav.";
-    const ggml_tensor * cb = f.get(g + "quant.first.codebook.weight");
+    const ggml_tensor * cb = f.keep(g + "quant.first.codebook.weight");
     lvl = f32(cb); n_lvl = (int) cb->ne[0];
-    qo_w = f32(f.get(g + "quant.first.out_proj.weight")); qo_b = f32(f.get(g + "quant.first.out_proj.bias"));
-    in_b = f32(f.get(g + "tfm.in_proj.bias")); out_b = f32(f.get(g + "tfm.out_proj.bias"));
-    out_norm = f32(f.get(g + "tfm.output_norm.weight"));
+    qo_w = f32(f.keep(g + "quant.first.out_proj.weight")); qo_b = f32(f.keep(g + "quant.first.out_proj.bias"));
+    in_b = f32(f.keep(g + "tfm.in_proj.bias")); out_b = f32(f.keep(g + "tfm.out_proj.bias"));
+    out_norm = f32(f.keep(g + "tfm.output_norm.weight"));
     auto whole = [&](imi_q8g & dst, std::vector<const ggml_tensor *> parts) {
         std::vector<std::pair<const ggml_tensor *, int>> o;
         for (auto * p : parts) for (int r = 0; r < p->ne[1]; r++) o.push_back({ p, r });
@@ -60,8 +60,8 @@ bool imi_codec::load(const std::string & path, int threads, imi_team * shared) {
         const std::string p = g + "tfm.blk." + std::to_string(il) + ".";
         if (!f.get(p + "ln1.weight", false)) break;
         layer L;
-        L.ln1 = f32(f.get(p + "ln1.weight")); L.ln2 = f32(f.get(p + "ln2.weight"));
-        L.post1 = f32(f.get(p + "attn_post_norm.weight")); L.post2 = f32(f.get(p + "ffn_post_norm.weight"));
+        L.ln1 = f32(f.keep(p + "ln1.weight")); L.ln2 = f32(f.keep(p + "ln2.weight"));
+        L.post1 = f32(f.keep(p + "attn_post_norm.weight")); L.post2 = f32(f.keep(p + "ffn_post_norm.weight"));
         if (const ggml_tensor * cw = f.get(p + "conv_dw.weight", false)) {
             L.conv = true;
             const int K = (int) cw->ne[0], C = (int) cw->ne[1];
@@ -70,7 +70,7 @@ bool imi_codec::load(const std::string & path, int threads, imi_team * shared) {
             for (int e = 0; e < C; e++) for (int k = 0; k < K; k++) conv_w_t.back()[(size_t) k * C + e] = f32(cw)[(size_t) e * K + k];
             ok &= whole(L.pw1, { f.get(p + "conv_pw1.weight") }) && whole(L.pw2, { f.get(p + "conv_pw2.weight") });
         } else {
-            L.q_norm = f32(f.get(p + "attn_q_norm.weight")); L.k_norm = f32(f.get(p + "attn_k_norm.weight"));
+            L.q_norm = f32(f.keep(p + "attn_q_norm.weight")); L.k_norm = f32(f.keep(p + "attn_k_norm.weight"));
             const ggml_tensor * q = f.get(p + "attn_q.weight"), * k = f.get(p + "attn_k.weight"), * gw = f.get(p + "attn_gate.weight");
             head_dim = (int) f.get(p + "attn_q_norm.weight")->ne[0];
             n_head = (int) (q->ne[1] / head_dim); n_head_kv = (int) (k->ne[1] / head_dim);
@@ -89,6 +89,7 @@ bool imi_codec::load(const std::string & path, int threads, imi_team * shared) {
     // conv weights now sit in conv_w_t in layer order
     for (size_t il = 0, ic = 0; il < layers.size(); il++) if (layers[il].conv) layers[il].conv_w = conv_w_t[ic++].data();
     if (!ok) { fprintf(stderr, "imi-codec: a codec table is not 8-bit\n"); return false; }
+    f.drop_data();   // every other table is in our layout (or copied, like the conv taps and gates) now
 
     n_threads = shared ? shared->n : threads;
     per.resize(n_threads);

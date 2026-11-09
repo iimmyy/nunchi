@@ -50,12 +50,12 @@ const float * f32(const ggml_tensor * t) { return t ? (const float *) t->data : 
 
 bool imi_seoul::load(const std::string & path, int threads, int ctx_len, imi_team * shared) {
     if (!f.load(path, false)) return false;
-    const ggml_tensor * te = f.get("token_embd.weight");
+    const ggml_tensor * te = f.keep("token_embd.weight");   // read while running: input words and word scores
     if (te->type != GGML_TYPE_Q6_K) { fprintf(stderr, "imi-seoul: word table must be Q6_K\n"); return false; }
     tok = (const uint8_t *) te->data; tok_row = te->nb[1];
     n_embd = (int) te->ne[0]; n_vocab = (int) te->ne[1];
-    out_norm   = f32(f.get("output_norm.weight"));
-    rope_freqs = f32(f.get("rope_freqs.weight", false));
+    out_norm   = f32(f.keep("output_norm.weight"));
+    rope_freqs = f32(f.keep("rope_freqs.weight", false));
     eps           = f.key_f("lfm3.attention.layer_norm_rms_epsilon", 1e-5f);
     rope_base     = f.key_f("lfm3.rope.freq_base", 1e6f);
     rope_base_swa = f.key_f("lfm3.rope.freq_base_swa", 1e4f);
@@ -84,10 +84,10 @@ bool imi_seoul::load(const std::string & path, int threads, int ctx_len, imi_tea
     for (int il = 0; il < n_layer; il++) {
         const std::string p = "blk." + std::to_string(il) + ".";
         layer & L = layers[il];
-        L.attn_norm      = f32(f.get(p + "attn_norm.weight"));
-        L.post_attn_norm = f32(f.get(p + "post_attention_norm.weight"));
-        L.ffn_norm       = f32(f.get(p + "ffn_norm.weight"));
-        L.post_ffn_norm  = f32(f.get(p + "post_ffw_norm.weight"));
+        L.attn_norm      = f32(f.keep(p + "attn_norm.weight"));
+        L.post_attn_norm = f32(f.keep(p + "post_attention_norm.weight"));
+        L.ffn_norm       = f32(f.keep(p + "ffn_norm.weight"));
+        L.post_ffn_norm  = f32(f.keep(p + "post_ffw_norm.weight"));
         bool ok = true;
         if (f.get(p + "shortconv.conv.weight", false)) {
             L.conv = true;
@@ -104,8 +104,8 @@ bool imi_seoul::load(const std::string & path, int threads, int ctx_len, imi_tea
             const ggml_tensor * k = f.get(p + "attn_k.weight");
             ok &= whole(L.qkvg, { f.get(p + "attn_q.weight"), k, f.get(p + "attn_v.weight"), f.get(p + "attn_gate.weight") });
             ok &= whole(L.o, { f.get(p + "attn_output.weight") });
-            L.q_norm = f32(f.get(p + "attn_q_norm.weight"));
-            L.k_norm = f32(f.get(p + "attn_k_norm.weight"));
+            L.q_norm = f32(f.keep(p + "attn_q_norm.weight"));
+            L.k_norm = f32(f.keep(p + "attn_k_norm.weight"));
             L.swa = swa[il];
             L.ai = n_attn++;
             n_head_kv = (int) (k->ne[1] / head_dim);
@@ -120,6 +120,7 @@ bool imi_seoul::load(const std::string & path, int threads, int ctx_len, imi_tea
         if (!ok) { fprintf(stderr, "imi-seoul: layer %d has a table our kernels do not read\n", il); return false; }
         for (imi_q4 * w : { &L.in_proj, &L.out_proj, &L.qkvg, &L.o, &L.gate_up, &L.down }) bytes += w->bytes;
     }
+    f.drop_data();   // every table is in our layout now; the file's keys stay for the word list
     n_ctx = ctx_len;
     const int kvd = n_head_kv * head_dim;
     k_cache.assign(n_attn, std::vector<uint16_t>((size_t) n_ctx * kvd));

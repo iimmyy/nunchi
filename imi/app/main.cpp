@@ -4,6 +4,7 @@
 //   nunchi [--model seoul.gguf] [--mm seoul-mm.gguf] [--port 8080] [--threads N] [--no-voice] [--no-browser]
 //          [--terms terms.txt] [--wav RECORDING.wav [--from SECONDS]]
 //   --wav plays a recording in as if it were live (for trying it out without a microphone)
+#include "ggml.h"
 #include "live.h"
 #include "pages.h"
 #include "qr.h"
@@ -18,9 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,14 +35,48 @@
 
 std::vector<std::string> nunchi_addresses();
 
+// Files by UTF-8 name on every system. Windows' plain file calls (fopen, std::ifstream) read a name in the computer's
+// old code page, so a folder with Korean letters in its path (a Korean user name puts them in the Desktop's path) would
+// not open. ggml_fopen hands the name to Windows' wide-character call instead (elsewhere it is plain fopen).
+static FILE * open_utf8(const std::string & p, const char * mode) { return ggml_fopen(p.c_str(), mode); }
+static bool exists(const std::string & p) {
+    FILE * f = open_utf8(p, "rb");
+    if (f) fclose(f);
+    return f != nullptr;
+}
+static std::string read_file(const std::string & p) {
+    std::string s;
+    if (FILE * f = open_utf8(p, "rb")) {
+        char b[65536];
+        size_t n;
+        while ((n = fread(b, 1, sizeof b, f)) > 0) s.append(b, n);
+        fclose(f);
+    }
+    return s;
+}
+static bool write_file(const std::string & p, const std::string & s) {
+    FILE * f = open_utf8(p, "wb");
+    if (!f) return false;
+    const bool ok = fwrite(s.data(), 1, s.size(), f) == s.size();
+    return fclose(f) == 0 && ok;
+}
+#ifdef _WIN32
+static std::string utf8(const wchar_t * w) {
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 1 ? n - 1 : 0, '\0');
+    if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
+    return s;
+}
+#endif
+
 static std::atomic<bool> g_stop{ false };
 static void on_signal(int) { g_stop = true; }
 
 static std::string exe_dir(const char * argv0) {
     std::string p;
 #ifdef _WIN32
-    char b[MAX_PATH];
-    if (GetModuleFileNameA(nullptr, b, MAX_PATH)) p = b;
+    std::vector<wchar_t> b(32768);
+    if (GetModuleFileNameW(nullptr, b.data(), (DWORD) b.size())) p = utf8(b.data());
 #elif defined(__APPLE__)
     char b[4096];
     uint32_t n = sizeof b;
@@ -58,7 +91,6 @@ static std::string exe_dir(const char * argv0) {
     return s == std::string::npos ? "." : p.substr(0, s);
 }
 
-static bool exists(const std::string & p) { std::ifstream f(p, std::ios::binary); return (bool) f; }
 
 static void open_browser(const std::string & url) {
 #ifdef _WIN32
@@ -72,9 +104,7 @@ static void open_browser(const std::string & url) {
 
 // a WAV file (16-bit or float PCM, any channels) as mono samples, and its rate
 static bool read_wav(const std::string & path, std::vector<float> & out, int & rate) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    std::vector<char> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::string d = read_file(path);
     if (d.size() < 12 || memcmp(d.data(), "RIFF", 4) || memcmp(d.data() + 8, "WAVE", 4)) return false;
     int fmt = 0, ch = 0, bits = 0;
     for (size_t i = 12; i + 8 <= d.size();) {
@@ -107,25 +137,30 @@ static bool read_wav(const std::string & path, std::vector<float> & out, int & r
     return false;
 }
 
-static std::string read_file(const std::string & p) {
-    std::ifstream f(p, std::ios::binary);
-    std::stringstream s;
-    s << f.rdbuf();
-    return s.str();
-}
 
 int main(int argc, char ** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
-    const std::string dir = exe_dir(argv[0]);
+    // the arguments as UTF-8 (on Windows argv comes in the old code page; the wide command line has every letter)
+    std::vector<std::string> args(argv, argv + argc);
+#ifdef _WIN32
+    int wn = 0;
+    if (wchar_t ** w = CommandLineToArgvW(GetCommandLineW(), &wn)) {
+        args.clear();
+        for (int i = 0; i < wn; i++) args.push_back(utf8(w[i]));
+        LocalFree(w);
+    }
+#endif
+    argc = (int) args.size();
+    const std::string dir = exe_dir(args.empty() ? "" : args[0].c_str());
     std::string model, mm, wav, terms_file;
     int port = 8080, threads = (int) std::thread::hardware_concurrency();
     double from = 0;
     bool voice = true, browser = true;
     for (int i = 1; i < argc; i++) {
-        const std::string a = argv[i];
-        auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+        const std::string a = args[i];
+        auto val = [&]() -> std::string { return i + 1 < argc ? args[++i] : ""; };
         if (a == "--model") model = val();
         else if (a == "--mm") mm = val();
         else if (a == "--port") port = atoi(val().c_str());
@@ -195,8 +230,8 @@ int main(int argc, char ** argv) {
             rep.body = "ok";
         } else if (r.path == "/api/terms" && r.method == "POST") {
             live.set_terms(r.body);
-            if (!terms_file.empty()) { std::ofstream f(terms_file, std::ios::binary); f << r.body; }
-            else { std::ofstream f(dir + "/terms.txt", std::ios::binary); f << r.body; terms_file = dir + "/terms.txt"; }
+            if (terms_file.empty()) terms_file = dir + "/terms.txt";
+            write_file(terms_file, r.body);
             rep.type = "text/plain";
             rep.body = "ok";
         } else if (r.path == "/api/state") {
@@ -276,6 +311,11 @@ int main(int argc, char ** argv) {
     printf("Close this window to stop.\n\n");
     fflush(stdout);
     if (browser && wav.empty()) open_browser("http://localhost:" + std::to_string(port) + "/screen");
+#ifdef _WIN32
+    // the computer must not sleep or turn its screen off in the middle of a sermon: while this window is open, Windows
+    // keeps both awake (it ends with the program)
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+#endif
     while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     if (player.joinable()) player.join();
     engine.join();

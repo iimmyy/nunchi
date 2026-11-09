@@ -202,7 +202,7 @@ imi_talk_stats imi_speak(imi_seoul & brain, imi_voice & voice, imi_codec & codec
 }
 
 void imi_write_wav(const std::string & path, const std::vector<float> & pcm, int sr) {
-    FILE * o = fopen(path.c_str(), "wb");
+    FILE * o = ggml_fopen(path.c_str(), "wb");
     if (!o) return;
     const uint32_t nb = (uint32_t) pcm.size() * 2, cs = 36 + nb, br = sr * 2, s16 = 16, srr = sr;
     const uint16_t one = 1, ba = 2, bits = 16;
