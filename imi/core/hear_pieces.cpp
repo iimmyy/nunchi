@@ -1,6 +1,7 @@
 // imi-hear-pieces: research, hearing short pieces (cut at the speaker's pauses) one at a time with the normal hearing
 // prompt (the same as imi-hear), in one process. Writes each piece's Korean next to it (PIECE.ko.txt) and prints
 // one line per piece: sound seconds, words, ms. Pieces named wN-KK.f32: the earlier pieces are the same wN's.
+// IMI_ASR_LANG=English hears the pieces as English instead (the language name goes into the prompt as it is).
 // IMI_CTX_S=S (research): each piece is heard with the earlier pieces (whole pieces, up to S seconds before it) in front
 // of it, and the Korean already written for them goes in as the start of the answer, so the model writes only the new
 // piece's words. The layout is the trained one (one clip, one answer). All of it is heard again for every piece.
@@ -38,7 +39,7 @@ int main(int argc, char ** argv) {
     if (!words.load(brain.f)) return 1;
     imi_ears ears;
     if (!ears.load(argv[2], threads, &team)) return 1;
-    const std::vector<int32_t> pre = words.encode_prompt("<|startoftext|><|im_start|>system\nPerform ASR in Korean.<|im_end|>\n<|im_start|>user\n<|vision_start|>"),
+    const std::vector<int32_t> pre = words.encode_prompt(std::string("<|startoftext|><|im_start|>system\nPerform ASR in ") + (getenv("IMI_ASR_LANG") ? getenv("IMI_ASR_LANG") : "Korean") + ".<|im_end|>\n<|im_start|>user\n<|vision_start|>"),
                                post = words.encode_prompt("<|vision_end|><|im_end|>\n<|im_start|>assistant\n<think></think>");
     const double ctx_s = getenv("IMI_CTX_S") ? atof(getenv("IMI_CTX_S")) : 0.0;
     const double keep_s = getenv("IMI_KEEP_S") ? atof(getenv("IMI_KEEP_S")) : 0.0;

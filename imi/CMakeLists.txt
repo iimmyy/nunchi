@@ -118,6 +118,11 @@ add_executable(imi-speak core/speak.cpp core/talk.cpp core/seoul.cpp core/voice.
 target_include_directories(imi-speak PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(imi-speak PRIVATE cxx_std_20)
 target_link_libraries(imi-speak PRIVATE ggml ggml-cpu)
+# research: the voice hears the speaker's Korean before saying the English (does his feeling carry over?)
+add_executable(imi-voice-hears core/voice_hears.cpp core/ears.cpp core/talk.cpp core/seoul.cpp core/voice.cpp core/codec.cpp core/words.cpp core/tables.cpp model.cpp)
+target_include_directories(imi-voice-hears PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(imi-voice-hears PRIVATE cxx_std_20)
+target_link_libraries(imi-voice-hears PRIVATE ggml ggml-cpu)
 # research: are the ears' rows final while the audio is still coming in?
 add_executable(imi-ears-causal core/ears_causal.cpp core/ears.cpp core/tables.cpp model.cpp)
 target_include_directories(imi-ears-causal PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
