@@ -1,9 +1,10 @@
 // imi hears: our ears into our brain, then the Korean words one at a time, always the top-scoring word (the hearing
 // setting, temperature 0), until <|im_end|>.
-//   imi-hear MODEL.gguf MMPROJ.gguf CLIP.f32 [threads] [OUT.txt] [OUT.ids]
+//   imi-hear MODEL.gguf MMPROJ.gguf CLIP.f32 [threads] [OUT.txt] [OUT.ids] [LANGUAGE]
 // The prompt is the fork's own, word for word (its /apply-template and /tokenize on the same model file):
 //   <|startoftext|><|im_start|>system\nPerform ASR in Korean.<|im_end|>\n<|im_start|>user\n<|vision_start|>
 //   (the sound positions) <|vision_end|><|im_end|>\n<|im_start|>assistant\n<think></think>
+// LANGUAGE (default Korean) changes only the system line, e.g. English to check what our voice said.
 #include "ears.h"
 #include "seoul.h"
 #include "words.h"
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 // plain-text words as the fork's tokenizer splits them; the control words are checked against the word list at start
@@ -18,7 +20,7 @@ static const int32_t PRE[]  = { 97357, 97362, 20460, 207, 89141, 10040, 58, 296,
 static const int32_t POST[] = { 97473, 97363, 207, 97362, 53502, 207, 97364, 97365 };
 
 int main(int argc, char ** argv) {
-    if (argc < 4) { fprintf(stderr, "usage: imi-hear MODEL.gguf MMPROJ.gguf CLIP.f32 [threads] [OUT.txt] [OUT.ids]\n"); return 1; }
+    if (argc < 4) { fprintf(stderr, "usage: imi-hear MODEL.gguf MMPROJ.gguf CLIP.f32 [threads] [OUT.txt] [OUT.ids] [LANGUAGE]\n"); return 1; }
     const int threads = argc > 4 ? atoi(argv[4]) : 4;
     using clk = std::chrono::steady_clock;
     auto secs = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
@@ -50,12 +52,15 @@ int main(int argc, char ** argv) {
     std::vector<float> emb;
     const int P = ears.encode(pcm.data(), (int) pcm.size(), emb);
     const double t_ears = secs(t0); t0 = clk::now();
+    std::vector<int32_t> pre(PRE, PRE + sizeof(PRE) / 4);
+    if (argc > 7)
+        pre = words.encode_prompt(std::string("<|startoftext|><|im_start|>system\nPerform ASR in ") + argv[7] + ".<|im_end|>\n<|im_start|>user\n<|vision_start|>");
     brain.reset();
-    brain.step_batch(PRE, nullptr, (int) (sizeof(PRE) / 4), false);
+    brain.step_batch(pre.data(), nullptr, (int) pre.size(), false);
     brain.step_batch(nullptr, emb.data(), P, false);
     brain.step_batch(POST, nullptr, (int) (sizeof(POST) / 4), true);
     const double t_prompt = secs(t0); t0 = clk::now();
-    const int n_prompt = (int) (sizeof(PRE) / 4) + P + (int) (sizeof(POST) / 4);
+    const int n_prompt = (int) pre.size() + P + (int) (sizeof(POST) / 4);
 
     std::vector<int32_t> ids;
     for (int i = 0; i < 512; i++) {
