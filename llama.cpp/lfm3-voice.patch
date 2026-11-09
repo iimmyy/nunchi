@@ -1,0 +1,281 @@
+diff --git a/include/llama.h b/include/llama.h
+index ae54e66..25d7dbb 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1109,6 +1109,10 @@ extern "C" {
+     // TODO: rename to avoid confusion with llama_get_embeddings()
+     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
+ 
++    // Skip the LM head: output rows carry the hidden state (embeddings) only, logits are not computed.
++    // For callers that feed the hidden state onward and never sample, e.g. audio frames of a talker.
++    LLAMA_API void llama_set_skip_logits(struct llama_context * ctx, bool value);
++
+     // Set whether to use causal attention or not
+     // If set to true, the model will only attend to the past tokens
+     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 33ad784..b3881b2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -210,6 +210,7 @@ llama_context::llama_context(
+     cparams.embeddings              = params.embeddings;
+     cparams.embeddings_nextn        = false;
+     cparams.embeddings_nextn_masked = false;
++    cparams.skip_logits             = false;
+     cparams.offload_kqv             = params.offload_kqv;
+     cparams.no_perf                 = params.no_perf;
+     cparams.warmup                  = false;
+@@ -1361,6 +1362,11 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+     cparams.embeddings_nextn_masked = masked;
+ }
+ 
++void llama_context::set_skip_logits(bool value) {
++    // the graph without the LM head is a subset of the reserved one, so no re-reserve; graph reuse compares the flag
++    cparams.skip_logits = value;
++}
++
+ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
+ 
+@@ -4222,6 +4228,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
+     ctx->set_embeddings(embeddings);
+ }
+ 
++void llama_set_skip_logits(llama_context * ctx, bool value) {
++    ctx->set_skip_logits(value);
++}
++
+ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
+     ctx->set_causal_attn(causal_attn);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..7a05b52 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -119,6 +119,7 @@ struct llama_context {
+ 
+     void set_embeddings (bool value);
+     void set_embeddings_nextn(bool value, bool masked);
++    void set_skip_logits(bool value);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 0c260f7..d83d667 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -35,6 +35,7 @@ struct llama_cparams {
+     bool embeddings;
+     bool embeddings_nextn;        // also extract the hidden state before the final output norm
+     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
++    bool skip_logits;             // outputs give the hidden state only, the LM head is not computed
+     bool causal_attn;
+     bool offload_kqv;
+     bool flash_attn;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index cffd083..0a7a8c0 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4209,6 +4209,10 @@ void llm_graph_context::build_logits() const {
+     if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE) {
+         res->t_logits = nullptr;
+     }
++    // hidden state only (see llama_set_skip_logits)
++    if (cparams.skip_logits && cparams.embeddings) {
++        res->t_logits = nullptr;
++    }
+ 
+     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
+     if (res->t_logits != nullptr) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index c1a7d36..8699673 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -901,6 +901,7 @@ struct llm_graph_params {
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
++            cparams.skip_logits             == other.cparams.skip_logits             &&
+             cparams.causal_attn             == other.cparams.causal_attn             &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+diff --git a/tools/mtmd/mtmd-helper-gen.cpp b/tools/mtmd/mtmd-helper-gen.cpp
+index d0342b9..53538a8 100644
+--- a/tools/mtmd/mtmd-helper-gen.cpp
++++ b/tools/mtmd/mtmd-helper-gen.cpp
+@@ -108,6 +108,8 @@ public:
+     // continuing a sequence (inp->n_past > 0) with the model's own text/audio switching
+     virtual bool supports_continue() const { return false; }
+     virtual bool next_is_text() const { return false; }
++    // whether the next step_gen() reads the sampled token; pipelines that read only the hidden state skip the LM head
++    virtual bool needs_sampled() const { return true; }
+ 
+     std::vector<llama_logit_bias> logit_bias; // see mtmd_helper_gen_audio_get_logit_bias()
+ 
+@@ -1386,6 +1388,10 @@ public:
+         return mode == MODE_TEXT || (mode == MODE_MIXED && !speaking);
+     }
+ 
++    bool needs_sampled() const override {
++        return next_is_text();
++    }
++
+     // one generate() step: a text token from the caller or an audio frame from the hidden state
+     int32_t step_gen(llama_token sampled, const float * h_state_in, const float ** h_state_out, bool * out_stop) override {
+         const bool interleaving = mode == MODE_MIXED;
+@@ -1418,9 +1424,11 @@ public:
+             std::vector<int32_t> codes;
+             const float * fb = nullptr;
+             bool is_eos = false;
++            const int64_t t0 = ggml_time_us();
+             if (!sample_frame(h_state_in, codes, &fb, &is_eos)) {
+                 return 1;
+             }
++            st_gen_us += ggml_time_us() - t0;
+             if (is_eos) {
+                 if (!continuing) {
+                     // TTS: the end of audio ends the generation
+@@ -1435,14 +1443,25 @@ public:
+                 mode = MODE_TEXT;
+             } else {
+                 hist.insert(hist.end(), codes.begin(), codes.end());
++                const int64_t t1 = ggml_time_us();
+                 if (!decode_wav(codes.data(), codes.size())) {
+                     return 1;
+                 }
++                st_wav_us += ggml_time_us() - t1;
+             }
+             decode_embd_batch batch_embd(const_cast<float *>(fb), 1, 1, n_embd);
+             batch_embd.set_position_normal(pos, seq_id);
+             batch_embd.logits[0] = 1;
+-            if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch_embd.render(lctx, 0, 1)) != 0) {
++            // the next step is an audio frame too (it reads only the hidden state): skip the LM head.
++            // text follows after the end of audio, and after the last frame of an interleaved audio block
++            const bool text_next = is_eos || (interleaving && !text_done && slots_left == 1);
++            llama_set_skip_logits(lctx, !text_next);
++            const int64_t t2 = ggml_time_us();
++            const int32_t rc = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch_embd.render(lctx, 0, 1));
++            st_brain_us += ggml_time_us() - t2;
++            st_frames++;
++            llama_set_skip_logits(lctx, false);
++            if (rc != 0) {
+                 LOG_ERR("mtmd_helper_gen_audio: decode failed\n");
+                 return 1;
+             }
+@@ -1462,6 +1481,7 @@ public:
+     }
+ 
+     int32_t get_output(int32_t * out_sample_rate, const char ** out_data, size_t * out_data_len, int64_t * out_n_samples) override {
++        print_stages();
+         *out_sample_rate = info.sample_rate;
+ 
+         if (!stream) {
+@@ -1522,8 +1542,27 @@ public:
+ 
+ private:
+     // checked by the converter
++    // stage timers (LG_TTS_STAGES=1 prints them at the end), for the imi.cpp step-1 breakdown
++    int64_t st_gen_us = 0, st_wav_us = 0, st_brain_us = 0, st_frames = 0;
++    void print_stages() const {
++        if (getenv("LG_TTS_STAGES") && st_frames > 0) {
++            fprintf(stderr, "stages over %lld frames: generator %.1f ms/frame, codec %.1f ms/frame, brain %.1f ms/frame\n",
++                (long long) st_frames, st_gen_us / 1e3 / st_frames, st_wav_us / 1e3 / st_frames, st_brain_us / 1e3 / st_frames);
++        }
++    }
++
+     static constexpr int   n_cb        = 12;
+-    static constexpr int   schedule[]  = { 4, 4, 4 }; // codebooks revealed per depthformer pass
++    // codebooks revealed per depthformer pass; the reference is {4, 4, 4}. LG_GEN_SCHEDULE="6,6" tries fewer passes
++    static std::vector<int> make_schedule() {
++        std::vector<int> v;
++        if (const char * e = getenv("LG_GEN_SCHEDULE")) {
++            for (const char * c = e; *c;) { v.push_back(atoi(c)); while (*c && *c != ',') c++; if (*c) c++; }
++        }
++        int sum = 0; for (int x : v) sum += x;
++        if (v.empty() || sum != 12) v = { 4, 4, 4 };
++        return v;
++    }
++    const std::vector<int> schedule = make_schedule();
+ 
+     // a random order of the codebooks, revealed by the schedule; fb is the feedback embedding of the codes.
+     // at the end of audio every code is the end code, its feedback embedding is only built when continuing
+@@ -1550,6 +1589,7 @@ private:
+             }
+             const size_t n_vocab = out.n_feats / n_cb;
+             logits.assign(out.feats, out.feats + out.n_feats);
++            gen_dump(0, h_state, codes.data(), out.feats, out.n_feats);
+             for (int j = 0; j < n_pick; j++, k++) {
+                 const int i = order[(size_t) k];
+                 float * l = logits.data() + (size_t) i * n_vocab;
+@@ -1575,10 +1615,22 @@ private:
+             return false;
+         }
+         fb_buf.assign(out.embd, out.embd + n_embd);
++        gen_dump(1, h_state, codes.data(), out.embd, (size_t) n_embd);
+         *fb = fb_buf.data();
+         return true;
+     }
+ 
++    // LG_GEN_DUMP=path: every depthformer pass as a record, the answer key for imi.cpp's generator.
++    // record: int32 kind (0 pass logits, 1 feedback embedding), int32 n_embd, f32 h_state[n_embd], int32 codes[n_cb],
++    //         int32 n_out, f32 out[n_out]
++    void gen_dump(int32_t kind, const float * h, const int32_t * c, const float * o, size_t n_out) {
++        static FILE * f = getenv("LG_GEN_DUMP") ? fopen(getenv("LG_GEN_DUMP"), "wb") : nullptr;
++        if (!f) return;
++        const int32_t ne = n_embd, no = (int32_t) n_out;
++        fwrite(&kind, 4, 1, f); fwrite(&ne, 4, 1, f); fwrite(h, 4, ne, f); fwrite(c, 4, n_cb, f);
++        fwrite(&no, 4, 1, f); fwrite(o, 4, n_out, f); fflush(f);
++    }
++
+     // CTRL penalty over the codes codebook cb took in the last rep_window frames
+     void apply_rep_penalty(float * l, size_t n_vocab, int cb) const {
+         if (rep_penalty <= 1.0f || rep_window <= 0) {
+@@ -1785,6 +1837,10 @@ bool mtmd_helper_gen_audio_next_is_text(mtmd_helper_gen_audio * ctx) {
+     return ctx->pipeline && ctx->pipeline->next_is_text();
+ }
+ 
++bool mtmd_helper_gen_audio_needs_sampled(mtmd_helper_gen_audio * ctx) {
++    return !ctx->pipeline || ctx->pipeline->needs_sampled();
++}
++
+ const llama_logit_bias * mtmd_helper_gen_audio_get_logit_bias(mtmd_helper_gen_audio * ctx, size_t * n_bias) {
+     *n_bias = ctx->pipeline ? ctx->pipeline->logit_bias.size() : 0;
+     return *n_bias ? ctx->pipeline->logit_bias.data() : nullptr;
+diff --git a/tools/mtmd/mtmd-helper.h b/tools/mtmd/mtmd-helper.h
+index 99ae173..da88b27 100644
+--- a/tools/mtmd/mtmd-helper.h
++++ b/tools/mtmd/mtmd-helper.h
+@@ -289,6 +289,9 @@ MTMD_API int32_t mtmd_helper_gen_audio_step_gen(
+ // false if the next step generates an audio frame from h_state_in
+ MTMD_API bool mtmd_helper_gen_audio_next_is_text(mtmd_helper_gen_audio * ctx);
+ 
++// false if the next step_gen() ignores the sampled token (and the last decode may have skipped the LM head)
++MTMD_API bool mtmd_helper_gen_audio_needs_sampled(mtmd_helper_gen_audio * ctx);
++
+ // bias for the text tokens the caller samples (e.g. no switch to audio in a text-only response), n_bias is set to its size
+ MTMD_API const llama_logit_bias * mtmd_helper_gen_audio_get_logit_bias(mtmd_helper_gen_audio * ctx, size_t * n_bias);
+ 
+@@ -389,6 +392,9 @@ struct gen_audio {
+     int32_t step_gen(llama_token sampled, const float * h_state, const float ** h_state_out, bool * out_stop = nullptr) {
+         return mtmd_helper_gen_audio_step_gen(ctx.get(), sampled, h_state, h_state_out, out_stop);
+     }
++    bool needs_sampled() {
++        return mtmd_helper_gen_audio_needs_sampled(ctx.get());
++    }
+     bool next_is_text() {
+         return mtmd_helper_gen_audio_next_is_text(ctx.get());
+     }
+diff --git a/tools/tts/tts.cpp b/tools/tts/tts.cpp
+index 8949373..6055332 100644
+--- a/tools/tts/tts.cpp
++++ b/tools/tts/tts.cpp
+@@ -185,7 +185,8 @@ int main(int argc, char ** argv) {
+ 
+         n_frames++;
+         h_state = h_next;
+-        sampled = sample_semantic_code();
++        // an audio frame reads only the hidden state; its LM head may be skipped, so sample only when text is next
++        sampled = gen.needs_sampled() ? sample_semantic_code() : LLAMA_TOKEN_NULL;
+         timings.report(n_frames);
+     }
+     const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;

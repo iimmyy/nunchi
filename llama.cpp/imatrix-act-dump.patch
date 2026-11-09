@@ -1,0 +1,66 @@
+diff --git a/tools/imatrix/imatrix.cpp b/tools/imatrix/imatrix.cpp
+index 5e9f911..5b0a0b5 100644
+--- a/tools/imatrix/imatrix.cpp
++++ b/tools/imatrix/imatrix.cpp
+@@ -739,6 +739,61 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void *
+             LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
+             exit(1);
+         }
++        // Little Guy: LG_ACT_DUMP=<dir> saves the input rows (f16, appended) of one matrix per distinct input, for
++        // output-matching quantization (LittleGuy tools/squeeze/match.py). One matrix stands for its siblings that read
++        // the same input (attn_q for k/v, ffn_gate for up). LG_ACT_WANT=suffix,suffix overrides which matrices.
++        // LG_ACT_MAX caps the rows per matrix, LG_ACT_EVERY=k keeps every k-th row (by position, so two models fed the
++        // same text keep the same rows), LG_ACT_LAYERS=lo-hi limits the layers. Ported from the Gemma fork (0034, 0036)
++        // with LFM3's short-conv matrices added.
++        static const char * lg_act_dir = getenv("LG_ACT_DUMP");
++        if (lg_act_dir && n_mat == 1) {
++            static std::vector<std::string> lg_wanted = [] {
++                std::vector<std::string> w;
++                const char * env = getenv("LG_ACT_WANT");
++                std::string s = env ? env : ".attn_q.weight,.ffn_gate.weight,.attn_output.weight,.ffn_down.weight,"
++                                            ".shortconv.in_proj.weight,.shortconv.out_proj.weight";
++                size_t p = 0;
++                while (p <= s.size()) {
++                    size_t q = s.find(',', p);
++                    if (q == std::string::npos) { q = s.size(); }
++                    if (q > p) { w.push_back(s.substr(p, q - p)); }
++                    p = q + 1;
++                }
++                return w;
++            }();
++            static const int64_t lg_max   = getenv("LG_ACT_MAX") ? atoll(getenv("LG_ACT_MAX")) : INT64_MAX;
++            static const int64_t lg_every = getenv("LG_ACT_EVERY") ? std::max<int64_t>(1, atoll(getenv("LG_ACT_EVERY"))) : 1;
++            static std::unordered_map<std::string, int64_t> lg_rows, lg_seen;
++            bool want = false;
++            for (const auto & s : lg_wanted) {
++                want |= wname.size() > s.size() && wname.compare(wname.size() - s.size(), s.size(), s) == 0;
++            }
++            if (wname == "output.weight" || wname == "token_embd.weight") {
++                want = m_params.process_output;   // the word-scoring input (final hidden state), with --process-output
++            }
++            static int lg_lo = -1, lg_hi = 1 << 30;
++            if (lg_lo < 0) { lg_lo = 0; if (const char * ev = getenv("LG_ACT_LAYERS")) { sscanf(ev, "%d-%d", &lg_lo, &lg_hi); } }
++            int il = -1;
++            if (want && sscanf(wname.c_str(), "blk.%d.", &il) == 1 && (il < lg_lo || il > lg_hi)) { want = false; }
++            int64_t & have = lg_rows[wname];
++            int64_t & seen = lg_seen[wname];
++            if (want && have < lg_max) {
++                FILE * f = fopen((std::string(lg_act_dir) + "/" + wname + ".f16").c_str(), "ab");
++                std::vector<ggml_fp16_t> buf(src1->ne[0]);
++                for (int64_t i3 = 0; i3 < src1->ne[3] && have < lg_max; ++i3) {
++                    for (int64_t i2 = 0; i2 < src1->ne[2] && have < lg_max; ++i2) {
++                        for (int64_t row = 0; row < src1->ne[1] && have < lg_max; ++row) {
++                            if (seen++ % lg_every != 0) { continue; }
++                            ++have;
++                            const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
++                            ggml_fp32_to_fp16_row(x, buf.data(), src1->ne[0]);
++                            fwrite(buf.data(), sizeof(ggml_fp16_t), buf.size(), f);
++                        }
++                    }
++                }
++                fclose(f);
++            }
++        }
+         // only 1 count in practice, except when a tensor is used for both MUL_MAT_ID and MUL_MAT
+         for (size_t i = 0; i < e.counts.size(); ++i) {
+             e.counts[i] += ggml_nrows(src1) / n_mat;
