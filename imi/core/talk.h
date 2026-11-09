@@ -8,6 +8,7 @@
 #include "codec.h"
 
 #include <cstdint>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,27 @@ struct imi_talk_stats {
 
 // the prompt for English speech in the male voice (the "tts" chat template)
 std::string imi_tts_prompt(const std::string & english);
+
+// one utterance, a frame at a time, so the caller owns the brain step after each frame (and can share it with
+// another conversation's step, see imi_seoul::step2):
+//   begin(prompt); while (next(pcm, fb)) brain.step(-1, fb, false);
+struct imi_talker {
+    imi_seoul & brain; imi_voice & voice; imi_codec & codec;
+    imi_talk_stats st;
+    imi_talker(imi_seoul & b, imi_voice & v, imi_codec & c) : brain(b), voice(v), codec(c) {}
+    // resets the brain's own conversation and the codec, reads the prompt
+    void begin(const std::vector<int32_t> & prompt, unsigned seed, int max_frames = 2000);
+    // the next frame's codes from brain.hidden; true: its samples were appended and fb (voice.n_in wide) is the brain's
+    // next input; false: speech is over (the codec has been flushed)
+    bool next(std::vector<float> & pcm, float * fb);
+private:
+    std::mt19937 rng;
+    int max_frames = 2000;
+    std::vector<int32_t> hist;
+    std::vector<float> scores;
+    std::vector<double> p;
+    std::vector<char> seen;
+};
 
 // resets the brain, reads `prompt`, speaks; appends 24 kHz samples to pcm
 imi_talk_stats imi_speak(imi_seoul & brain, imi_voice & voice, imi_codec & codec, const std::vector<int32_t> & prompt,

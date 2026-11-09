@@ -16,6 +16,15 @@
 #include <string>
 #include <vector>
 
+// one conversation's memory (attention caches, conv memory, position) and its latest outputs. The brain holds one as
+// its own; others are swapped in, or ride along in step2().
+struct imi_seoul_state {
+    std::vector<std::vector<uint16_t>> k_cache, v_cache;
+    std::vector<std::vector<float>> conv_state;
+    int pos = 0;
+    std::vector<float> hidden, logits;
+};
+
 struct imi_seoul {
     struct layer {
         const float *attn_norm, *post_attn_norm, *ffn_norm, *post_ffn_norm;
@@ -52,6 +61,12 @@ struct imi_seoul {
     // Every table is read once per 64 positions. hidden (and logits, if asked) are the last position's;
     // hidden_all, if given, gets every position's hidden state ([n][n_embd]).
     void step_batch(const int32_t * tokens, const float * embd, int n, bool want_logits, float * hidden_all = nullptr);
+    // a second conversation's memory: a fresh state sized like ours; swap_state trades ours for it (no copying)
+    imi_seoul_state new_state() const;
+    void swap_state(imi_seoul_state & s);
+    // two conversations one position each, every table read once for both: ours (token_a | embd_a) and b's
+    // (token_b | embd_b). Each gets exactly the numbers its own step() would give.
+    void step2(int32_t token_a, const float * embd_a, bool logits_a, imi_seoul_state & b, int32_t token_b, const float * embd_b, bool logits_b);
     // research: every layer table read back to back, ncol (1 or 2) inputs riding each read; best ms over reps
     double bench_tables(int ncol, int reps);
     ~imi_seoul();
@@ -60,6 +75,7 @@ private:
     struct per_thread {
         std::vector<float> x, h, t, u;   // running state, norm out, scratch, conv out
         imi_q8 qi; imi_q8k qk;
+        std::vector<float> x2; imi_q8 qi2;   // the second conversation in step2
     };
     imi_team own_team;
     imi_team * team = &own_team;
@@ -68,6 +84,8 @@ private:
     std::unique_ptr<std::atomic<int>[]> ctr;
     int n_ctr = 512;
     void run(int tid, int32_t token, const float * embd, bool want_logits);
+    std::vector<float> bcx2, qkv2, att2, y2, act2, fo2;   // step2's second set
+    void run2(int tid, imi_seoul_state & b, const int32_t tok[2], const float * const emb[2], const bool want[2]);
     // batch reading
     static constexpr int NB = 64;
     std::vector<float> bX, bH, bBig, bY, bAct;   // [NB][...]

@@ -147,6 +147,165 @@ void imi_seoul::reset() {
     for (auto & s : conv_state) std::fill(s.begin(), s.end(), 0.0f);
 }
 
+imi_seoul_state imi_seoul::new_state() const {
+    imi_seoul_state s;
+    s.k_cache.assign(k_cache.size(), std::vector<uint16_t>(k_cache.empty() ? 0 : k_cache[0].size()));
+    s.v_cache.assign(v_cache.size(), std::vector<uint16_t>(v_cache.empty() ? 0 : v_cache[0].size()));
+    s.conv_state.assign(conv_state.size(), {});
+    for (size_t il = 0; il < conv_state.size(); il++) s.conv_state[il].assign(conv_state[il].size(), 0.0f);
+    s.hidden.assign(n_embd, 0.0f); s.logits.assign(n_vocab, 0.0f);
+    return s;
+}
+
+void imi_seoul::swap_state(imi_seoul_state & s) {
+    k_cache.swap(s.k_cache); v_cache.swap(s.v_cache); conv_state.swap(s.conv_state);
+    std::swap(pos, s.pos); hidden.swap(s.hidden); logits.swap(s.logits);
+}
+
+void imi_seoul::step2(int32_t token_a, const float * embd_a, bool logits_a, imi_seoul_state & b, int32_t token_b, const float * embd_b, bool logits_b) {
+    if (pos >= n_ctx || b.pos >= n_ctx) { fprintf(stderr, "imi-seoul: context full (%d)\n", n_ctx); return; }
+    if (bcx2.empty()) {
+        bcx2.resize(bcx.size()); qkv2.resize(qkv.size()); att2.resize(att.size()); y2.resize(y.size()); act2.resize(act.size()); fo2.resize(fo.size());
+        for (auto & T : per) T.x2.resize(n_embd);
+    }
+    for (int i = 0; i < n_ctr; i++) ctr[i].store(0, std::memory_order_relaxed);
+    const int32_t tok[2] = { token_a, token_b };
+    const float * const emb[2] = { embd_a, embd_b };
+    const bool want[2] = { logits_a, logits_b };
+    team->run([&](int tid) { run2(tid, b, tok, emb, want); });
+    pos++; b.pos++;
+}
+
+// run() for two conversations at once: the same math per conversation, in the same order, so each conversation's
+// numbers match its own step(); only the table reads are shared (imi_q4_group2 accumulates each input exactly as
+// imi_q4_group does).
+void imi_seoul::run2(int tid, imi_seoul_state & B, const int32_t tok[2], const float * const emb[2], const bool want[2]) {
+    per_thread & T = per[tid];
+    const int E = n_embd, D = head_dim, kvd = n_head_kv * D, grp = n_head / n_head_kv;
+    float * x[2] = { T.x.data(), T.x2.data() };
+    imi_q8 * qi[2] = { &T.qi, &T.qi2 };
+    float * bc[2] = { bcx.data(), bcx2.data() }, * qk_[2] = { qkv.data(), qkv2.data() }, * at[2] = { att.data(), att2.data() };
+    float * yy[2] = { y.data(), y2.data() }, * ac[2] = { act.data(), act2.data() }, * fq[2] = { fo.data(), fo2.data() };
+    std::vector<std::vector<float>> * cs[2] = { &conv_state, &B.conv_state };
+    std::vector<std::vector<uint16_t>> * kcs[2] = { &k_cache, &B.k_cache }, * vcs[2] = { &v_cache, &B.v_cache };
+    const int ps[2] = { pos, B.pos };
+    for (int s = 0; s < 2; s++) {
+        if (tok[s] >= 0) imi_q6k_dequant_row(this->tok + (size_t) tok[s] * tok_row, x[s], E / 256);   // tok[] here is the step's words, this->tok the word table
+        else memcpy(x[s], emb[s], (size_t) E * sizeof(float));
+    }
+    int c = 0;
+    auto table2 = [&](const imi_q4 & W, float * o0, float * o1) {
+        std::atomic<int> & k = ctr[c++];
+        const int ng = W.rows / 8;
+        for (int g = k.fetch_add(4, std::memory_order_relaxed); g < ng; g = k.fetch_add(4, std::memory_order_relaxed)) {
+            const int e = std::min(ng, g + 4);
+            for (int gg = g; gg < e; gg++) imi_q4_group2(W, *qi[0], *qi[1], gg, o0 + 8 * gg, o1 + 8 * gg);
+        }
+    };
+    auto table_ffn2 = [&](const imi_q4 & W, float * o0, float * o1) {
+        std::atomic<int> & k = ctr[c++];
+        const int ng = W.rows / 8;
+        float a0[8], a1[8], b0[8], b1[8];
+        for (int g = k.fetch_add(4, std::memory_order_relaxed); g < ng; g = k.fetch_add(4, std::memory_order_relaxed)) {
+            const int e = std::min(ng, g + 4);
+            for (int gg = g; gg < e; gg += 2) {
+                imi_q4_group2(W, *qi[0], *qi[1], gg, a0, a1); imi_q4_group2(W, *qi[0], *qi[1], gg + 1, b0, b1);
+                float * p0 = o0 + 8 * (gg / 2), * p1 = o1 + 8 * (gg / 2);
+                for (int i = 0; i < 8; i++) { p0[i] = silu(a0[i]) * b0[i]; p1[i] = silu(a1[i]) * b1[i]; }
+            }
+        }
+    };
+    auto sync = [&] { team->sync(); };
+    for (size_t il = 0; il < layers.size(); il++) {
+        const layer & L = layers[il];
+        for (int s = 0; s < 2; s++) { norm_mul(x[s], L.attn_norm, T.h.data(), E, eps); qi[s]->from(T.h.data(), E); }
+        if (L.conv) {
+            table2(L.in_proj, bc[0], bc[1]);
+            sync();
+            for (int s = 0; s < 2; s++) {
+                const float * b = bc[s], * cc = b + E, * xx = b + 2 * E, * st = (*cs[s])[il].data(), * w = L.conv_w;
+                float * u = T.u.data();
+                for (int e = 0; e < E; e++) u[e] = b[e] * xx[e] * w[d_conv * E + e];
+                for (int k = 0; k < d_conv; k++) { const float * sk = st + k * E, * wk = w + k * E; for (int e = 0; e < E; e++) u[e] += sk[e] * wk[e]; }
+                for (int e = 0; e < E; e++) u[e] *= cc[e];
+                qi[s]->from(u, E);
+            }
+            table2(L.out_proj, yy[0], yy[1]);
+            sync();
+            if (tid == 0)
+                for (int s = 0; s < 2; s++) {
+                    const float * b = bc[s], * xx = b + 2 * E;
+                    float * sw = (*cs[s])[il].data();
+                    memmove(sw, sw + E, (size_t) (d_conv - 1) * E * sizeof(float));
+                    for (int e = 0; e < E; e++) sw[(d_conv - 1) * E + e] = b[e] * xx[e];
+                }
+        } else {
+            table2(L.qkvg, qk_[0], qk_[1]);
+            sync();
+            const float base = L.swa ? rope_base_swa : rope_base;
+            const float * ff = L.swa ? nullptr : rope_freqs;
+            const float scale = 1.0f / sqrtf((float) D);
+            for (int u2 = tid; u2 < 2 * n_head_kv; u2 += n_threads) {     // (conversation, key/value head) pairs
+                const int s = u2 / n_head_kv, g = u2 % n_head_kv, p = ps[s];
+                const float * qv = qk_[s];
+                uint16_t * kc = (*kcs[s])[L.ai].data(), * vc = (*vcs[s])[L.ai].data();
+                const int s0 = (L.swa && n_swa > 0) ? std::max(0, p - n_swa + 1) : 0, nk = p - s0 + 1;
+                float kk[512];
+                norm_mul(qv + n_head * D + g * D, L.k_norm, kk, D, eps);
+                rope(kk, D, p, base, ff);
+                const float * vv = qv + n_head * D + kvd + g * D;
+                for (int i = 0; i < D; i++) { kc[(size_t) p * kvd + g * D + i] = imi_f2h(kk[i]); vc[(size_t) p * kvd + g * D + i] = imi_f2h(vv[i]); }
+                for (int hh = 0; hh < grp; hh++) {
+                    const int h = g * grp + hh;
+                    float q[512], o[512];
+                    norm_mul(qv + h * D, L.q_norm, q, D, eps);
+                    rope(q, D, p, base, ff);
+                    float * sc = T.t.data(), mx = -INFINITY;
+                    for (int t = 0; t < nk; t++) { sc[t] = dot_h(q, kc + (size_t) (s0 + t) * kvd + g * D, D) * scale; mx = std::max(mx, sc[t]); }
+                    double sum = 0;
+                    for (int t = 0; t < nk; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+                    const float inv = (float) (1.0 / sum);
+                    std::fill(o, o + D, 0.0f);
+                    for (int t = 0; t < nk; t++) axpy_h(sc[t] * inv, vc + (size_t) (s0 + t) * kvd + g * D, o, D);
+                    const float gate = 1.0f / (1.0f + expf(-qv[n_head * D + 2 * kvd + h]));
+                    for (int i = 0; i < D; i++) at[s][h * D + i] = o[i] * gate;
+                }
+            }
+            sync();
+            for (int s = 0; s < 2; s++) qi[s]->from(at[s], n_head * D);
+            table2(L.o, yy[0], yy[1]);
+            sync();
+        }
+        for (int s = 0; s < 2; s++) {
+            imi_norm_mul_add(yy[s], L.post_attn_norm, x[s], E, eps);
+            norm_mul(x[s], L.ffn_norm, T.h.data(), E, eps);
+            qi[s]->from(T.h.data(), E);
+        }
+        table_ffn2(L.gate_up, ac[0], ac[1]);
+        sync();
+        for (int s = 0; s < 2; s++) qi[s]->from(ac[s], n_ff);
+        table2(L.down, fq[0], fq[1]);
+        sync();
+        for (int s = 0; s < 2; s++) imi_norm_mul_add(fq[s], L.post_ffn_norm, x[s], E, eps);
+    }
+    std::vector<float> * hid_out[2] = { &hidden, &B.hidden }, * log_out[2] = { &logits, &B.logits };
+    for (int s = 0; s < 2; s++) {
+        float * hid = T.h.data();
+        norm_mul(x[s], out_norm, hid, E, eps);
+        if (tid == 0) memcpy(hid_out[s]->data(), hid, (size_t) E * sizeof(float));
+        if (want[s]) {
+            T.qk.from(hid, E);
+            std::atomic<int> & k = ctr[c++];
+            const int nb = E / 256, chunk = 64;
+            float * lg = log_out[s]->data();
+            for (int r = k.fetch_add(chunk, std::memory_order_relaxed); r < n_vocab; r = k.fetch_add(chunk, std::memory_order_relaxed)) {
+                const int e = std::min(n_vocab, r + chunk);
+                for (int i = r; i < e; i++) lg[i] = imi_q6k_row(this->tok + (size_t) i * tok_row, T.qk, nb);
+            }
+        }
+    }
+}
+
 void imi_seoul::step(int32_t token, const float * embd, bool want_logits) {
     if (pos >= n_ctx) { fprintf(stderr, "imi-seoul: context full (%d)\n", n_ctx); return; }
     for (int i = 0; i < n_ctr; i++) ctr[i].store(0, std::memory_order_relaxed);
