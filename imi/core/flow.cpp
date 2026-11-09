@@ -37,6 +37,7 @@ int main(int argc, char ** argv) {
     const std::string dir = argv[3];
     const int threads = atoi(argv[4]);
     const bool ride = atoi(argv[5]) != 0;
+    const bool by_sentence = getenv("IMI_SENTENCES") != nullptr;   // research: the voice one sentence at a time
     std::vector<std::string> clips(argv + 6, argv + argc);
     imi_team team;
     team.start(threads);
@@ -104,7 +105,8 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < clips.size(); i++) {
         sound_total += jobs[i].sound_s;
         imi_talker tk(brain, voice, codec);
-        tk.begin(words.encode_prompt(imi_tts_prompt(jobs[i].en_text)), 11);
+        if (by_sentence) tk.begin_sentences(words, jobs[i].en_text, 11, 2000, std::string(getenv("IMI_SENTENCES")) != "fresh");
+        else tk.begin(words.encode_prompt(imi_tts_prompt(jobs[i].en_text)), 11);
         text_job * nx = i + 1 < clips.size() ? &jobs[i + 1] : nullptr;
         if (nx) start(*nx, clips[i + 1]);
         std::vector<float> pcm;
@@ -124,7 +126,8 @@ int main(int argc, char ** argv) {
         imi_write_wav(dir + "/" + jobs[i].name + ".wav", pcm, 24000);
         { std::ofstream f(dir + "/" + jobs[i].name + ".ko.txt"); f << jobs[i].ko_text; }
         { std::ofstream f(dir + "/" + jobs[i].name + ".en.txt"); f << jobs[i].en_text; }
-        fprintf(stderr, "imi-flow: %s done (%.2f s of sound, %d frames), %.1f s in\n", jobs[i].name.c_str(), jobs[i].sound_s, tk.st.frames, secs(t_all));
+        fprintf(stderr, "imi-flow: %s done (%.2f s of sound, %d frames, %d sentences, %d capped), %.1f s in\n", jobs[i].name.c_str(),
+                jobs[i].sound_s, tk.st.frames, tk.st.sentences, tk.st.capped, secs(t_all));
     }
     const double total = secs(t_all);
     fprintf(stderr, "imi-flow: %zu windows, %.1f s of sound in %.1f s -> %.3f CPU-s per sound second (ride %d: %d shared steps, %d text alone, %d voice alone)\n",

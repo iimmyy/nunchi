@@ -66,7 +66,7 @@ target_include_directories(imi-flow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(imi-flow PRIVATE cxx_std_20)
 target_link_libraries(imi-flow PRIVATE ggml ggml-cpu)
 # imi speaks: brain + voice generator + codec, one thread team
-add_executable(imi-speak core/speak.cpp core/talk.cpp core/seoul.cpp core/voice.cpp core/codec.cpp core/tables.cpp model.cpp)
+add_executable(imi-speak core/speak.cpp core/talk.cpp core/seoul.cpp core/voice.cpp core/codec.cpp core/words.cpp core/tables.cpp model.cpp)
 target_include_directories(imi-speak PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(imi-speak PRIVATE cxx_std_20)
 target_link_libraries(imi-speak PRIVATE ggml ggml-cpu)
