@@ -2,6 +2,7 @@
 // barrier, so a step has exactly as many stops as the math needs. Between steps they spin a little, then sleep.
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -21,6 +22,8 @@ struct imi_team {
 
     void start(int nthreads) {
         n = nthreads < 1 ? 1 : nthreads;
+        spin_sync = pauses_for(30);     // inside a step a teammate is usually microseconds away
+        spin_idle = pauses_for(1000);   // between steps, a millisecond before a worker sleeps
         for (int t = 1; t < n; t++) th.emplace_back([this, t] { worker(t); });
     }
     // every member runs f(tid), the caller as tid 0; returns when all are done
@@ -30,7 +33,7 @@ struct imi_team {
         gen.fetch_add(1, std::memory_order_release);
         wake();
         f(0);
-        while (done.load(std::memory_order_acquire) != n - 1) IMI_PAUSE();
+        wait_for([&] { return done.load(std::memory_order_acquire) == n - 1; });
     }
     // inside f: wait for the whole team
     void sync() {
@@ -40,8 +43,7 @@ struct imi_team {
             arrived.store(0, std::memory_order_relaxed);
             phase.store(p + 1, std::memory_order_release);
         } else {
-            int spins = 0;
-            while (phase.load(std::memory_order_acquire) == p) { IMI_PAUSE(); if (++spins > (1 << 22)) std::this_thread::yield(); }
+            wait_for([&] { return phase.load(std::memory_order_acquire) != p; });
         }
     }
     ~imi_team() {
@@ -59,6 +61,28 @@ private:
     alignas(64) std::atomic<int> arrived{0};
     alignas(64) std::atomic<int> phase{0};
     std::atomic<bool> quit{false};
+    int spin_sync = 1000, spin_idle = 30000;
+
+    // Waiting for a teammate: spin a short while (the answer is usually microseconds away), then give the processor
+    // back on every look. A teammate can be pushed off its processor by anything else on the computer (the browser,
+    // the virus scanner); spinning on would keep every processor busy while it waits to get back, and one busy program
+    // made a step 5x slower that way (8 threads on an 8-thread computer). Giving way lets it back at once.
+    template <class Done> void wait_for(Done done_now) const {
+        for (int spins = 0; !done_now();) {
+            if (spins < spin_sync) { IMI_PAUSE(); spins++; } else std::this_thread::yield();
+        }
+    }
+    // How many pauses make the given microseconds on this processor: one pause is about 10 cycles on older Intel
+    // chips (Haswell) and about 140 on Skylake and newer, so a count alone would wait 14x longer on a new
+    // laptop than on an older one.
+    static int pauses_for(double us) {
+        const int probe = 20000;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < probe; i++) IMI_PAUSE();
+        const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / probe;
+        const double n = us * 1000.0 / (ns > 0.1 ? ns : 0.1);
+        return n < 64 ? 64 : n > 4e6 ? 4000000 : (int) n;
+    }
 
     // a sleeping worker wakes when gen moves on. C++20's atomic wait does it where the library has it (Mac, Linux);
     // GCC 10's library (Ubuntu 22.04's Windows cross-compiler) predates it, so there a lock and a signal do the same:
@@ -82,7 +106,7 @@ private:
         for (;;) {
             int g, spins = 0;
             while ((g = gen.load(std::memory_order_acquire)) == seen) {
-                if (++spins < 200000) IMI_PAUSE(); else sleep_while(seen);
+                if (++spins < spin_idle) IMI_PAUSE(); else sleep_while(seen);
             }
             seen = g;
             if (quit.load()) return;

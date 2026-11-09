@@ -26,6 +26,7 @@
 
 #ifdef _WIN32
 #include "win_compat.h"
+#include <mmsystem.h>
 #include <shellapi.h>
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -138,9 +139,30 @@ static bool read_wav(const std::string & path, std::vector<float> & out, int & r
 }
 
 
+#ifdef _WIN32
+// Windows, for as long as the program runs: the computer must not sleep or turn its screen off in the middle of a
+// sermon, must not slow Nunchi down to save power when its window is behind the screen page (Windows 11's EcoQoS),
+// and must wake its waits on time (Windows' timer ticks every 15.6 ms unless a program asks for 1 ms; all of it
+// ends with the program).
+static void windows_full_speed() {
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+    timeBeginPeriod(1);
+    PROCESS_POWER_THROTTLING_STATE pt = {};
+    pt.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    pt.StateMask   = 0;
+    if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt))) return;
+    // Windows 10 has no timer-resolution throttling and refuses the whole request when it's asked for (error 87)
+    pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt)))
+        printf("(Windows did not take the full-speed setting, error %lu; Nunchi still runs)\n", (unsigned long) GetLastError());
+}
+#endif
+
 int main(int argc, char ** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+    windows_full_speed();
 #endif
     // the arguments as UTF-8 (on Windows argv comes in the old code page; the wide command line has every letter)
     std::vector<std::string> args(argv, argv + argc);
@@ -155,7 +177,9 @@ int main(int argc, char ** argv) {
     argc = (int) args.size();
     const std::string dir = exe_dir(args.empty() ? "" : args[0].c_str());
     std::string model, mm, wav, terms_file;
-    int port = 8080, threads = (int) std::thread::hardware_concurrency();
+    // every processor but one: the browser showing the screen page (and taking the microphone) and Windows' own work
+    // need one, and a team that takes them all is slowed down whenever anything else runs
+    int port = 8080, threads = (int) std::thread::hardware_concurrency() - 1;
     double from = 0;
     bool voice = true, browser = true;
     for (int i = 1; i < argc; i++) {
@@ -287,17 +311,21 @@ int main(int argc, char ** argv) {
         int rate = 16000;
         if (!read_wav(wav, x, rate)) { printf("Can't read %s (16-bit, 24-bit or float WAV).\n", wav.c_str()); g_stop = true; }
         else {
-            std::vector<float> y;
-            nunchi_resampler r;
-            r.reset(rate, 16000);
+            // converted to 16 kHz as it plays, 100 ms at a time, the way the microphone's sound comes in (converting
+            // the whole file first held the start back by seconds: 200 s took 10 s on a Windows test machine)
             const size_t a = std::min(x.size(), (size_t) (from * rate));
-            r.push(x.data() + a, x.size() - a, y);
-            printf("Playing %s from %.1f s (%.1f s) in as if live.\n", wav.c_str(), from, y.size() / 16000.0);
-            player = std::thread([&live, y] {
+            printf("Playing %s from %.1f s (%.1f s) in as if live.\n", wav.c_str(), from, (x.size() - a) / (double) rate);
+            player = std::thread([&live, x = std::move(x), rate, a] {
+                nunchi_resampler r;
+                r.reset(rate, 16000);
+                std::vector<float> y;
+                const size_t chunk = (size_t) rate / 10;
                 const auto start = std::chrono::steady_clock::now();
-                for (size_t i = 0; i < y.size() && !g_stop; i += 1600) {
-                    std::this_thread::sleep_until(start + std::chrono::milliseconds(100 * (i / 1600 + 1)));
-                    live.push(y.data() + i, std::min<size_t>(1600, y.size() - i));
+                for (size_t i = a, j = 0; i < x.size() && !g_stop; i += chunk, j++) {
+                    std::this_thread::sleep_until(start + std::chrono::milliseconds(100 * (j + 1)));
+                    y.clear();
+                    r.push(x.data() + i, std::min(chunk, x.size() - i), y);
+                    if (!y.empty()) live.push(y.data(), y.size());
                 }
             });
         }
@@ -311,19 +339,6 @@ int main(int argc, char ** argv) {
     printf("Close this window to stop.\n\n");
     fflush(stdout);
     if (browser && wav.empty()) open_browser("http://localhost:" + std::to_string(port) + "/screen");
-#ifdef _WIN32
-    // the computer must not sleep or turn its screen off in the middle of a sermon: while this window is open, Windows
-    // keeps both awake (it ends with the program)
-    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
-    // and must not slow it down to save power when the window is behind the screen page (Windows 11's EcoQoS, which
-    // also lets a sleeping thread wake late): this program always runs at full speed while it is open
-    PROCESS_POWER_THROTTLING_STATE pt = {};
-    pt.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-    pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
-    pt.StateMask   = 0;
-    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt)))
-        printf("(Windows did not take the full-speed setting, error %lu; Nunchi still runs)\n", (unsigned long) GetLastError());
-#endif
     while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     if (player.joinable()) player.join();
     engine.join();

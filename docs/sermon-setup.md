@@ -13,8 +13,32 @@ internet, and no one installs anything on their phone.
   - a small travel router (the computer joins it by cable or Wi-Fi, phones join its Wi-Fi). The most dependable: it
     needs no internet and takes dozens of phones;
   - a phone's personal hotspot, for a few listeners (about five on an iPhone);
-  - the computer's own Mobile Hotspot (Windows Settings, Network, Mobile hotspot). Windows only turns it on while
-    the computer itself is on the internet, and it takes 8 phones at most.
+  - the computer's own Mobile Hotspot (Windows Settings, Network, Mobile hotspot). Nothing to buy, but Windows only
+    turns it on while the computer itself is on the internet, and it takes 8 phones unless you raise that. Below:
+    **The computer's own Wi-Fi**.
+
+## The computer's own Wi-Fi
+
+Windows turns its hotspot on only while the computer has internet, but people who use it this way say it keeps running
+once it's on (not yet tried on the church's computer). So a phone's hotspot starts it:
+
+1. Once per computer, for more than 8 phones: with the hotspot off, open **Terminal (Admin)** (right-click Start; on Windows 10, **Windows PowerShell (Admin)**) and
+   paste these two lines (Enter after each). The first raises the limit to 50 (128 at most), the second restarts the
+   hotspot service:
+
+   ```
+   reg add "HKLM\SYSTEM\CurrentControlSet\Services\icssvc\Settings" /v WifiMaxPeers /t REG_DWORD /d 50 /f
+   Restart-Service icssvc
+   ```
+
+   Settings, Network, Mobile hotspot then says "0 of 50" devices. Some Wi-Fi cards still stop at 8; if it still says
+   8, restart the computer once, and if it's still 8, that's the card.
+2. Turn on a phone's personal hotspot and join the computer to it.
+3. Settings, Network & internet, **Mobile hotspot**: set its name and password (Edit), turn **Power saving** off
+   ("when no devices are connected, turn off"), then turn **Mobile hotspot** on.
+4. Keep the phone's hotspot on if you can: the phones joining the computer then have internet too, and Androids
+   don't complain. If you turn it off, the computer's hotspot keeps running, and Nunchi doesn't need the internet.
+5. Type the computer's hotspot name and password into Nunchi's screen page, so its first QR code joins it.
 
 ## Before the service
 

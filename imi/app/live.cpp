@@ -427,7 +427,7 @@ void nunchi_live::run(const nunchi_events & ev, const std::atomic<bool> & stop) 
         return n * read_s;
     };
 
-    log("listening");
+    log("listening (ready in %.2f s)", now());
     while (!stop) {
         // the sound that came in: cut at his pauses
         {
