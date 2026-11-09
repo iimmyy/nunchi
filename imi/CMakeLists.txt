@@ -55,6 +55,21 @@ add_executable(imi-hear core/hear.cpp core/ears.cpp core/seoul.cpp core/words.cp
 target_include_directories(imi-hear PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(imi-hear PRIVATE cxx_std_20)
 target_link_libraries(imi-hear PRIVATE ggml ggml-cpu)
+# research: the live hearing layout (LFM3-Audio's) on Seoul, 12 rows (0.96 s) at a time
+add_executable(imi-hear-live core/hear_live.cpp core/ears.cpp core/seoul.cpp core/words.cpp core/tables.cpp model.cpp)
+target_include_directories(imi-hear-live PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(imi-hear-live PRIVATE cxx_std_20)
+target_link_libraries(imi-hear-live PRIVATE ggml ggml-cpu)
+# research: hearing short pieces cut at the speaker's pauses, one process
+add_executable(imi-hear-pieces core/hear_pieces.cpp core/ears.cpp core/seoul.cpp core/words.cpp core/tables.cpp model.cpp)
+target_include_directories(imi-hear-pieces PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(imi-hear-pieces PRIVATE cxx_std_20)
+target_link_libraries(imi-hear-pieces PRIVATE ggml ggml-cpu)
+# research: translating clause by clause as the Korean comes in, with the clauses before as context
+add_executable(imi-translate-pieces core/translate_pieces.cpp core/seoul.cpp core/words.cpp core/tables.cpp model.cpp)
+target_include_directories(imi-translate-pieces PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(imi-translate-pieces PRIVATE cxx_std_20)
+target_link_libraries(imi-translate-pieces PRIVATE ggml ggml-cpu)
 # the pipeline: hear -> translate (-> speak), one brain, one thread team
 add_executable(imi-nunchi core/nunchi.cpp core/ears.cpp core/seoul.cpp core/words.cpp core/talk.cpp core/voice.cpp core/codec.cpp core/tables.cpp model.cpp)
 target_include_directories(imi-nunchi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -65,8 +80,18 @@ add_executable(imi-flow core/flow.cpp core/ears.cpp core/seoul.cpp core/words.cp
 target_include_directories(imi-flow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(imi-flow PRIVATE cxx_std_20)
 target_link_libraries(imi-flow PRIVATE ggml ggml-cpu)
+# research: the instant interpreter on a clock (pieces cut at pauses, sentence-end translating, voice per sentence)
+add_executable(imi-instant core/instant.cpp core/ears.cpp core/seoul.cpp core/words.cpp core/talk.cpp core/voice.cpp core/codec.cpp core/tables.cpp model.cpp)
+target_include_directories(imi-instant PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(imi-instant PRIVATE cxx_std_20)
+target_link_libraries(imi-instant PRIVATE ggml ggml-cpu)
 # imi speaks: brain + voice generator + codec, one thread team
 add_executable(imi-speak core/speak.cpp core/talk.cpp core/seoul.cpp core/voice.cpp core/codec.cpp core/words.cpp core/tables.cpp model.cpp)
 target_include_directories(imi-speak PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(imi-speak PRIVATE cxx_std_20)
 target_link_libraries(imi-speak PRIVATE ggml ggml-cpu)
+# research: are the ears' rows final while the audio is still coming in?
+add_executable(imi-ears-causal core/ears_causal.cpp core/ears.cpp core/tables.cpp model.cpp)
+target_include_directories(imi-ears-causal PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(imi-ears-causal PRIVATE cxx_std_20)
+target_link_libraries(imi-ears-causal PRIVATE ggml ggml-cpu)
