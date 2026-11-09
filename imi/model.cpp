@@ -9,6 +9,16 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
+#ifdef _WIN32
+#include <malloc.h>
+// Windows: 2 MB-aligned memory and 64-bit file offsets have their own names
+static int posix_memalign(void ** p, size_t a, size_t n) { *p = _aligned_malloc(n, a); return *p ? 0 : 1; }
+static void aligned_free(void * p) { _aligned_free(p); }
+#define fseek64 _fseeki64
+#else
+static void aligned_free(void * p) { free(p); }
+#define fseek64 fseeko
+#endif
 
 ggml_backend_buffer_type_t imi_repack_buft() {
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -72,7 +82,7 @@ bool imi_file::load(const std::string & path, bool repack) {
     const size_t off0 = gguf_get_data_offset(meta);
     auto read_at = [&](const ggml_tensor * t, void * dst) {
         const int64_t i = gguf_find_tensor(meta, t->name);
-        return fseek(f, (long) (off0 + gguf_get_tensor_offset(meta, i)), SEEK_SET) == 0 && fread(dst, 1, ggml_nbytes(t), f) == ggml_nbytes(t);
+        return fseek64(f, (int64_t) (off0 + gguf_get_tensor_offset(meta, i)), SEEK_SET) == 0 && fread(dst, 1, ggml_nbytes(t), f) == ggml_nbytes(t);
     };
     size_t o = 0;
     for (ggml_tensor * t : plain) {
@@ -124,5 +134,5 @@ imi_file::~imi_file() {
     if (ctx) ggml_free(ctx);
     if (meta) gguf_free(meta);
     if (repacked) ggml_backend_buffer_free(repacked);
-    free(data);
+    aligned_free(data);
 }

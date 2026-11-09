@@ -9,6 +9,9 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
 #include <immintrin.h>
 #define IMI_AVX2 1
@@ -37,13 +40,22 @@ uint16_t imi_f2h(float f) {
 void * imi_big_alloc(size_t bytes) {
     const size_t a = 2u << 20, n = (bytes + a - 1) / a * a;
     void * p = nullptr;
+#ifdef _WIN32
+    p = _aligned_malloc(n, a);
+    if (!p) return nullptr;
+#else
     if (posix_memalign(&p, a, n) != 0) return nullptr;
+#endif
 #ifdef MADV_HUGEPAGE
     madvise(p, n, MADV_HUGEPAGE);
 #endif
     return p;
 }
+#ifdef _WIN32
+void imi_big_free(void * p) { _aligned_free(p); }
+#else
 void imi_big_free(void * p) { free(p); }
+#endif
 
 namespace {
 struct blk_q4_0 { uint16_t d; uint8_t qs[16]; };
