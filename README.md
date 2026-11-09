@@ -14,7 +14,7 @@ The model is called **Seoul**: LiquidAI's LFM3-Omni-2B with my changes. Design: 
 Aim for the worst, hope for the best. Everything gets timed on the weakest plausible CPU first (our floor box: a 2014
 Intel Haswell server chip, 2 real cores, AVX2 only, 7.5 GB). If it works there, it works everywhere.
 
-## Where it stands (2026-11-08)
+## Where it stands (2026-11-09)
 
 **Seoul made smaller (cut on a Mac, checked against 16-bit at every step)**
 
@@ -46,11 +46,30 @@ Intel Haswell server chip, 2 real cores, AVX2 only, 7.5 GB). If it works there, 
 | English voice, 1 GB Seoul + 8-bit generator + word table skip | **0.75x** | |
 
 One voice frame on the floor box (budget 80 ms for real time): brain 45 ms, voice generator 40 ms, codec 8 ms.
+On imi: brain 34.5 ms, voice generator 18.6 ms, codec 6.2 ms, so 1.35x real time.
 
-**imi.cpp** ([imi/](imi/)): our own engine, built for Seoul alone on top of ggml. First piece, the voice generator:
-scores bit-identical to llama.cpp on the Mac CPU (345 of 345 passes), and on the floor box 40.7 to 32.5 ms per frame
-with the same math kernels, from structure alone (input projection once per frame, only the 4 codebooks each pass
-picks are scored).
+**imi** ([imi/](imi/)): an engine written from scratch for Seoul alone. Its own thread team, table layout and math
+kernels; ggml only reads the model file. Every piece is checked against an exact float64 reference (a "truth key")
+and against the llama.cpp fork.
+
+- Ears: 1.9e-6 from the truth key (the fork: 5.0e-4), 0.03 CPU-seconds per second of sound.
+- Tokenizer: the same ids as the fork on 206 test texts (Korean, English and edge cases), every one decoding back.
+- Hearing and translation: the same Korean and the same English as the fork on window 1, character for character.
+- Live pipeline: while one window is spoken, the next one is heard and translated, and each text step rides on a
+  voice frame's brain step (one read of the weights, two conversations). Every output is byte for byte the same as
+  running each step alone.
+
+**The whole pipeline on the floor box, 4 threads** (CPU-seconds per second of sermon; under 1.0 keeps up live)
+
+| | llama.cpp fork | imi |
+|---|---|---|
+| Hearing, window 1 | 0.559 | 0.329 |
+| Translation, window 1 | 0.229 | 0.145 |
+| Hear, translate and speak, 20 windows, one step at a time | 2.02 | 1.218 |
+| Same 20 windows, live (text steps riding the voice) | | **1.035** |
+
+One window in 20 runs away: the voice loses its place in the English and rereads the last sentence for about a
+minute. Leaving that window out, the live pipeline is at 0.955. The fix being tested is reading one sentence at a time.
 
 **Wide ears** ([ears/widen_seoul.py](ears/widen_seoul.py)): a side path that lets Seoul hear 8 to 21.5 kHz, trained
 on subtitled sermons through real room recordings. Ties stock on a dry feed (9.7 vs 9.6), not yet clearly better in a
@@ -63,9 +82,10 @@ room. Still in progress.
 | [docs/](docs/) | The design |
 | [seoul/](seoul/) | Model cuts: word table trim, 4-bit output matching, multimodal file converter |
 | [ears/](ears/) | Wide-ears training |
-| [imi/](imi/) | imi.cpp, our engine |
+| [imi/](imi/) | imi, the engine Seoul runs on |
 | [llama.cpp/](llama.cpp/) | Our changes to llama.cpp, as patches |
 | [eval/](eval/) | Hearing tests through llama-server, calibration text, plain character-error scoring |
+| [memory/](memory/) | Memory research carried over from Little Guy: keeping what was already said |
 
 No model weights, recordings or subtitles are in this repo.
 
