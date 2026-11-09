@@ -463,3 +463,82 @@ void imi_q4_group_batch(const imi_q4 & W, const imi_q8b & X, int g, float * out)
     }
 #endif
 }
+
+// ---- float tables, 12 inputs ----
+namespace {
+template <typename T> void wg_fill(imi_wg & W, int rows, int cols, T get) {
+    W.cols = cols; W.rows = rows; W.rows_pad = (rows + 7) / 8 * 8;
+    const size_t esz = W.f32 ? 4 : 2;
+    W.bytes = (size_t) W.rows_pad * cols * esz;
+    W.w = imi_big_alloc(W.bytes);
+    memset(W.w, 0, W.bytes);
+    for (int r = 0; r < rows; r++) for (int k = 0; k < cols; k++) {
+        const size_t at = ((size_t) (r / 8) * cols + k) * 8 + r % 8;
+        if (W.f32) ((float *) W.w)[at] = get(r, k); else ((uint16_t *) W.w)[at] = get(r, k);
+    }
+}
+}
+bool imi_wg::build(const std::vector<std::pair<const ggml_tensor *, int>> & rows_in) {
+    if (rows_in.empty()) return false;
+    const ggml_tensor * t0 = rows_in[0].first;
+    const int c = (int) t0->ne[0];
+    for (const auto & p : rows_in) if (p.first->type != t0->type || p.first->ne[0] != c) return false;
+    auto row = [&](int i) { return (const char *) rows_in[i].first->data + (size_t) rows_in[i].second * rows_in[i].first->nb[1]; };
+    if (t0->type == GGML_TYPE_F16) {
+        f32 = false;
+        wg_fill(*this, (int) rows_in.size(), c, [&](int i, int k) { return ((const uint16_t *) row(i))[k]; });
+    } else if (t0->type == GGML_TYPE_F32) {
+        f32 = true;
+        wg_fill(*this, (int) rows_in.size(), c, [&](int i, int k) { return ((const float *) row(i))[k]; });
+    } else return false;
+    return w != nullptr;
+}
+bool imi_wg::build(const ggml_tensor * t) {
+    if (t->ne[2] != 1 || t->ne[3] != 1) return false;
+    std::vector<std::pair<const ggml_tensor *, int>> r;
+    for (int i = 0; i < (int) t->ne[1]; i++) r.push_back({ t, i });
+    return build(r);
+}
+bool imi_wg::build(const float * m, int r, int c) {
+    f32 = true;
+    wg_fill(*this, r, c, [&](int i, int k) { return m[(size_t) i * c + k]; });
+    return w != nullptr;
+}
+void imi_wg::release() { if (w) imi_big_free(w); w = nullptr; }
+
+void imi_wg_group12(const imi_wg & W, const float * xt, int g, float * out) {
+#ifdef IMI_AVX2
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0, a8 = a0, a9 = a0, a10 = a0, a11 = a0;
+#define IMI_WG_STEP(LOAD)                                                                                                       \
+    for (int k = 0; k < W.cols; k++) {                                                                                          \
+        const __m256 wv = LOAD;                                                                                                 \
+        const float * xk = xt + (size_t) k * 12;                                                                                \
+        a0  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 0), a0);   a1  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 1), a1);  \
+        a2  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 2), a2);   a3  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 3), a3);  \
+        a4  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 4), a4);   a5  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 5), a5);  \
+        a6  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 6), a6);   a7  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 7), a7);  \
+        a8  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 8), a8);   a9  = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 9), a9);  \
+        a10 = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 10), a10); a11 = _mm256_fmadd_ps(wv, _mm256_broadcast_ss(xk + 11), a11); \
+    }
+    if (W.f32) {
+        const float * w = (const float *) W.w + (size_t) g * W.cols * 8;
+        IMI_WG_STEP(_mm256_loadu_ps(w + (size_t) k * 8))
+    } else {
+        const uint16_t * w = (const uint16_t *) W.w + (size_t) g * W.cols * 8;
+        IMI_WG_STEP(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (w + (size_t) k * 8))))
+    }
+#undef IMI_WG_STEP
+    _mm256_storeu_ps(out + 0, a0);  _mm256_storeu_ps(out + 8, a1);  _mm256_storeu_ps(out + 16, a2); _mm256_storeu_ps(out + 24, a3);
+    _mm256_storeu_ps(out + 32, a4); _mm256_storeu_ps(out + 40, a5); _mm256_storeu_ps(out + 48, a6); _mm256_storeu_ps(out + 56, a7);
+    _mm256_storeu_ps(out + 64, a8); _mm256_storeu_ps(out + 72, a9); _mm256_storeu_ps(out + 80, a10); _mm256_storeu_ps(out + 88, a11);
+#else
+    for (int c = 0; c < 12; c++) for (int r = 0; r < 8; r++) {
+        float s = 0;
+        for (int k = 0; k < W.cols; k++) {
+            const size_t at = ((size_t) g * W.cols + k) * 8 + r;
+            s += (W.f32 ? ((const float *) W.w)[at] : imi_h2f(((const uint16_t *) W.w)[at])) * xt[(size_t) k * 12 + c];
+        }
+        out[8 * c + r] = s;
+    }
+#endif
+}

@@ -79,6 +79,21 @@ struct imi_q8g {
 void imi_q8g_group(const imi_q8g & W, const float * xt, int C, int g, float * out);
 void imi_q8_0_dequant_row(const void * row, float * y, int cols);
 
+// float tables (the ears) for many inputs at once: groups of 8 rows, the 8 rows' weights for column k side by side.
+// 16-bit weights stay 16-bit, exactly as in the file; 32-bit ones stay 32-bit.
+struct imi_wg {
+    int rows = 0, rows_pad = 0, cols = 0;
+    bool f32 = false;
+    void * w = nullptr;           // [rows_pad/8][cols][8], uint16_t (F16) or float
+    size_t bytes = 0;
+    bool build(const ggml_tensor * t);                  // 2-D F16 or F32 table [cols, rows]
+    bool build(const std::vector<std::pair<const ggml_tensor *, int>> & rows);   // chosen rows, all one type and width
+    bool build(const float * m, int rows, int cols);    // row-major float matrix [rows][cols]
+    void release();
+};
+// group g times 12 inputs (xt = [cols][12]) -> out[12][8]
+void imi_wg_group12(const imi_wg & W, const float * xt, int g, float * out);
+
 // the word table (Q6_K, rows of 256-value blocks)
 struct imi_q8k {
     int n = 0;
