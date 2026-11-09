@@ -25,7 +25,7 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <windows.h>
+#include "win_compat.h"
 #include <shellapi.h>
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -315,6 +315,14 @@ int main(int argc, char ** argv) {
     // the computer must not sleep or turn its screen off in the middle of a sermon: while this window is open, Windows
     // keeps both awake (it ends with the program)
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+    // and must not slow it down to save power when the window is behind the screen page (Windows 11's EcoQoS, which
+    // also lets a sleeping thread wake late): this program always runs at full speed while it is open
+    PROCESS_POWER_THROTTLING_STATE pt = {};
+    pt.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    pt.StateMask   = 0;
+    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt)))
+        printf("(Windows did not take the full-speed setting, error %lu; Nunchi still runs)\n", (unsigned long) GetLastError());
 #endif
     while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     if (player.joinable()) player.join();

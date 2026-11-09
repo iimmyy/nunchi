@@ -1,6 +1,6 @@
 # imi.cpp: an engine built for Seoul (LFM3-Omni) alone, from scratch: our own thread team, table layouts, kernels,
 # step loops and pipeline. ggml is only the GGUF file reader (core/); brain.cpp is the first try on ggml's graph.
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.18)
 project(imi CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(GGML_DIR "" CACHE PATH "ggml source (the ggml/ folder of our llama.cpp fork)")
@@ -36,6 +36,12 @@ if (NOT IMI_NATIVE)
   endif()
 endif()
 add_subdirectory(${GGML_DIR} ggml)
+if (WIN32)
+  # ggml-cpu.c opts its threads out of Windows 11's power saving with a part of Windows' API that old mingw-w64
+  # headers lack (app/win_compat.h declares it where missing)
+  set_source_files_properties(${GGML_DIR}/src/ggml-cpu/ggml-cpu.c TARGET_DIRECTORY ggml-cpu
+                              PROPERTIES COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/app/win_compat.h")
+endif()
 if (IMI_NATIVE AND NOT MSVC)
   add_compile_options(-march=native)
 elseif (IMI_ARCH STREQUAL "avx2")
@@ -128,5 +134,7 @@ target_include_directories(nunchi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(nunchi PRIVATE cxx_std_20)
 target_link_libraries(nunchi PRIVATE ggml ggml-cpu)
 if (WIN32)
+  # Windows 10 is the oldest Nunchi runs on; without this mingw-w64 assumes XP and hides newer calls (inet_ntop)
+  target_compile_definitions(nunchi PRIVATE _WIN32_WINNT=0x0A00)
   target_link_libraries(nunchi PRIVATE ws2_32 iphlpapi shell32 -static -static-libgcc -static-libstdc++)
 endif()

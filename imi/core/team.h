@@ -2,7 +2,9 @@
 // barrier, so a step has exactly as many stops as the math needs. Between steps they spin a little, then sleep.
 #pragma once
 #include <atomic>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -26,7 +28,7 @@ struct imi_team {
         job = &f;
         done.store(0, std::memory_order_relaxed);
         gen.fetch_add(1, std::memory_order_release);
-        gen.notify_all();
+        wake();
         f(0);
         while (done.load(std::memory_order_acquire) != n - 1) IMI_PAUSE();
     }
@@ -45,7 +47,7 @@ struct imi_team {
     ~imi_team() {
         quit.store(true);
         gen.fetch_add(1, std::memory_order_release);
-        gen.notify_all();
+        wake();
         for (auto & t : th) t.join();
     }
 
@@ -58,12 +60,29 @@ private:
     alignas(64) std::atomic<int> phase{0};
     std::atomic<bool> quit{false};
 
+    // a sleeping worker wakes when gen moves on. C++20's atomic wait does it where the library has it (Mac, Linux);
+    // GCC 10's library (Ubuntu 22.04's Windows cross-compiler) predates it, so there a lock and a signal do the same:
+    // the worker checks gen under the lock before it sleeps, and the waker takes the lock after moving gen, so a wake
+    // can never fall between the check and the sleep.
+#if defined(__cpp_lib_atomic_wait)
+    void wake() { gen.notify_all(); }
+    void sleep_while(int seen) { gen.wait(seen, std::memory_order_acquire); }
+#else
+    std::mutex m;
+    std::condition_variable cv;
+    void wake() { { std::lock_guard<std::mutex> l(m); } cv.notify_all(); }
+    void sleep_while(int seen) {
+        std::unique_lock<std::mutex> l(m);
+        cv.wait(l, [&] { return gen.load(std::memory_order_acquire) != seen; });
+    }
+#endif
+
     void worker(int tid) {
         int seen = 0;
         for (;;) {
             int g, spins = 0;
             while ((g = gen.load(std::memory_order_acquire)) == seen) {
-                if (++spins < 200000) IMI_PAUSE(); else gen.wait(seen, std::memory_order_acquire);
+                if (++spins < 200000) IMI_PAUSE(); else sleep_while(seen);
             }
             seen = g;
             if (quit.load()) return;
