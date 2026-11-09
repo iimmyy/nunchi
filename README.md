@@ -3,11 +3,11 @@
 A live Korean to English interpreter that runs on ordinary computers, offline. One small model does the hearing,
 the translating and the talking.
 
-- **Sermon mode:** a Korean sermon goes in, live English captions and an English voice come out, sent to everyone's
+- **interpreter mode:** a Korean speech goes in, live English captions and an English voice come out, sent to everyone's
   phone over a Wi-Fi network the computer makes itself. It runs on a plain office PC with no GPU.
 - **Conversation mode:** two people talk through a phone, offline (next).
 
-The model is **Seoul**: LiquidAI's LFM3-Omni-2B with our changes. Design: [docs/design.md](docs/design.md).
+The model is called **Seoul**: LiquidAI's LFM3-Omni-2B with my changes. Design: [docs/design.md](docs/design.md).
 
 ## Design rule
 
@@ -71,5 +71,4 @@ No model weights, recordings or subtitles are in this repo.
 
 ## Who
 
-Immy and Claude (Anthropic). Immy's designs: the wide ears, the floor-box rule, the English voice in sermon mode, and
-building our own engine. Claude writes the code.
+built by me and claude
