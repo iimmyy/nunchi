@@ -17,6 +17,14 @@
 // IMI_HEAR_AHEAD=1: while he is still talking, the piece's audio so far goes into the hearing memory (every 12 final
 //   rows, the ears' last row held back), so at his pause only the rest of it and the answer are left.
 // IMI_NO_VOICE=1: captions only (no voice); a sentence's lag is then the end of its Korean to its English written.
+// A cuts line may carry a 4th number, when the cut was known (pause_live.py: the moment the pause is long enough);
+//   the piece is in then. Without it, 0.2 s after the cut.
+// The voice's lead-in: while nothing is playing (the listener is waiting for this sentence), a sentence's quiet start
+//   isn't played: it begins 60 ms before its first sound. After a sentence still playing, the lead-in stays as the
+//   breath between them. IMI_LEAD=0 plays every lead-in.
+// The voice's prompt is read ahead (IMI_VP=0: not): the voice's fixed head is read once, and the English goes into a
+//   second voice memory (VP) word by word as it is translated, each word riding a translating step (step2), so at
+//   its turn only the prompt's last tokens are left to read. IMI_VP_CHECK=1 compares it with a fresh read.
 //   imi-instant MODEL.gguf MMPROJ.gguf OUT_DIR threads RIDE PIECES_DIR NAME [NAME ...]
 // PIECES_DIR holds NAME-KK.f32 and NAME.cuts ("KK start end" seconds per piece). Each NAME runs on its own, memories
 // fresh. Writes OUT_DIR/NAME.instant.tsv (one line per sentence), NAME.ko.txt, NAME.en.txt, NAME.live.wav (the English
@@ -30,6 +38,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -98,9 +107,13 @@ int main(int argc, char ** argv) {
         std::vector<piece> pieces;
         {
             std::ifstream cuts(pdir + "/" + name + ".cuts");
-            std::string kk; double s, e;
-            while (cuts >> kk >> s >> e) {
-                piece p; p.start = s; p.end = e; p.avail = e + cut_delay;
+            std::string line;
+            while (std::getline(cuts, line)) {
+                std::istringstream ls(line);
+                std::string kk; double s, e, ready = -1;
+                if (!(ls >> kk >> s >> e)) continue;
+                if (!(ls >> ready)) ready = -1;
+                piece p; p.start = s; p.end = e; p.avail = ready >= 0 ? ready : e + cut_delay;
                 FILE * f = fopen((pdir + "/" + name + "-" + kk + ".f32").c_str(), "rb");
                 if (!f) { fprintf(stderr, "no piece %s-%s\n", name.c_str(), kk.c_str()); return 1; }
                 float x; while (fread(&x, 4, 1, f) == 1) p.pcm.push_back(x);
@@ -151,8 +164,33 @@ int main(int argc, char ** argv) {
         size_t v_sent = 0;
         std::vector<float> fb(voice.n_in), pcm, live;   // live: the English as heard, 24 kHz
         double cursor = 0;            // when the speech made so far ends, as heard
-        int n_ride = 0, n_text_alone = 0, n_voice_alone = 0;
+        int n_ride = 0, n_text_alone = 0, n_voice_alone = 0, n_vp_ride = 0;
         double busy = 0;
+        bool v_lead = false;          // the sentence's quiet lead-in is being held back
+        std::vector<float> v_held;
+        // the voice's head in its own memory and in VP; a fresh sentence goes back to the end of it
+        static const bool vp_on = !getenv("IMI_VP") || atoi(getenv("IMI_VP")) != 0;
+        static const bool vp_check = getenv("IMI_VP_CHECK") && atoi(getenv("IMI_VP_CHECK")) > 0;
+        static const bool lead_on = !getenv("IMI_LEAD") || atoi(getenv("IMI_LEAD")) != 0;
+        const std::vector<int32_t> v_head = words.encode_prompt(imi_tts_head());
+        imi_seoul_state VP = brain.new_state();
+        brain.reset();
+        brain.step_batch(v_head.data(), nullptr, (int) v_head.size(), false);
+        const std::vector<std::vector<float>> v_head_conv = brain.conv_state;
+        brain.swap_state(VP);
+        brain.reset();
+        brain.step_batch(v_head.data(), nullptr, (int) v_head.size(), false);
+        brain.swap_state(VP);
+        tk.set_head(v_head, v_head_conv);
+        int vp_sent = -1;             // the sentence VP is reading (-1: none)
+        bool vp_bad = false;          // its words stopped matching: read it from the head at its turn
+        std::vector<int32_t> vp_plan; // its first English sentence so far, as tokens that can't change any more
+        size_t vp_done = 0;           // of vp_plan, read into VP
+        auto vp_begin = [&](size_t k) {
+            VP.pos = (int) v_head.size();
+            VP.conv_state = v_head_conv;
+            vp_sent = (int) k; vp_bad = false; vp_plan.clear(); vp_done = 0;
+        };
 
         const auto t0 = clk::now();
         auto now = [&] { return std::chrono::duration<double>(clk::now() - t0).count(); };
@@ -264,6 +302,7 @@ int main(int argc, char ** argv) {
             });
             x_ids.clear();
             x_busy = true;
+            if (vp_on && !no_voice && vp_sent < 0) vp_begin(x_sent);
         };
         // after a hearing step (or its reads): the next word, or the piece is done
         auto hear_pick = [&] {
@@ -276,8 +315,18 @@ int main(int argc, char ** argv) {
             h_begun = false;
             h_part = 0;
             const std::string ko = imi_ko_piece(words.text(h_ids.data(), (int) h_ids.size()));
+            if (getenv("IMI_PIECE_LOG")) fprintf(stderr, "  piece %zu %.2f-%.2f heard at %.2f: [%s]\n", next_piece, p.start, p.end, now(), ko.c_str());
             ko_now_s += p.end - p.start;
             if (!ko.empty()) ko_now += (ko_now.empty() ? "" : " ") + ko;
+            // a sentence end inside: the words before it are a sentence of their own, translated now
+            for (size_t e; (e = imi_ko_inner_end(ko_now)) != std::string::npos; ) {
+                sentence s; s.ko = ko_now.substr(0, e);
+                s.ko_s = ko_now_s * (double) e / ko_now.size(); s.ko_end = p.end;
+                sents.push_back(s);
+                to_translate.push_back(sents.size() - 1);
+                ko_now = ko_now.substr(ko_now.find_first_not_of(' ', e));
+                ko_now_s -= s.ko_s;
+            }
             const bool last = next_piece + 1 == pieces.size();
             if (!ko_now.empty() && (imi_ko_translate_now(ko_now, ko_now_s) || last)) {
                 sentence s; s.ko = ko_now; s.ko_s = ko_now_s; s.ko_end = p.end;
@@ -288,9 +337,33 @@ int main(int argc, char ** argv) {
             }
             next_piece++;
         };
+        // VP's plan: the English so far, up to its first sentence's end if that is in, else up to the last whole word
+        auto vp_update = [&] {
+            if (vp_sent != (int) x_sent || vp_bad) return;
+            std::string t = words.text(x_ids.data(), (int) x_ids.size());
+            const size_t a = t.find_first_not_of(" \t\n");
+            if (a == std::string::npos) return;
+            t = t.substr(a);
+            const std::vector<std::string> ss = imi_sentences(t);
+            std::string stable;
+            if (ss.size() >= 2) stable = ss[0];
+            else {
+                const size_t sp = t.find_last_of(" \t\n");
+                if (sp == std::string::npos) return;
+                stable = t.substr(0, sp);
+                const size_t b = stable.find_last_not_of(" \t\n");
+                if (b == std::string::npos) return;
+                stable = stable.substr(0, b + 1);
+            }
+            const std::vector<int32_t> plan = words.encode_prompt(stable);
+            size_t c = 0;
+            while (c < plan.size() && c < vp_plan.size() && plan[c] == vp_plan[c]) c++;
+            if (c < vp_done) { vp_bad = true; return; }
+            vp_plan = plan;
+        };
         auto translate_pick = [&] {
             const int w = best_of(X.logits);
-            if (w != words.im_end && x_ids.size() < 300) { x_ids.push_back(w); x_word = w; return; }
+            if (w != words.im_end && x_ids.size() < 300) { x_ids.push_back(w); x_word = w; vp_update(); return; }
             x_word = -1;
             x_busy = false;
             sentence & s = sents[x_sent];
@@ -304,8 +377,36 @@ int main(int argc, char ** argv) {
         auto speak_start = [&] {
             v_sent = to_speak.front();
             to_speak.pop_front();
-            tk.begin_sentences(words, sents[v_sent].en, 11 + (unsigned) v_sent, 2000, false);
+            bool read = true;
+            if (vp_on) {
+                const std::string & en = sents[v_sent].en;
+                std::vector<std::string> ss = imi_sentences(en);
+                if (ss.empty()) ss.push_back(en);
+                const std::vector<int32_t> full = words.encode_prompt(imi_tts_prompt(ss[0]));
+                const size_t h = v_head.size();
+                if (full.size() > h && std::equal(v_head.begin(), v_head.end(), full.begin())) {
+                    const bool mine = vp_sent == (int) v_sent && !vp_bad && full.size() > h + vp_done &&
+                                      std::equal(vp_plan.begin(), vp_plan.begin() + vp_done, full.begin() + h);
+                    if (!mine) { VP.pos = (int) h; VP.conv_state = v_head_conv; vp_done = 0; }
+                    in(VP, [&] { brain.step_batch(full.data() + h + vp_done, nullptr, (int) (full.size() - h - vp_done), false); });
+                    if (vp_check) {   // the same prompt read fresh, in one go
+                        imi_seoul_state F = brain.new_state();
+                        std::vector<float> got = VP.hidden;
+                        in(F, [&] { brain.reset(); brain.step_batch(full.data(), nullptr, (int) full.size(), false); });
+                        double d = 0;
+                        for (size_t i = 0; i < got.size(); i++) d = std::max(d, (double) std::fabs(got[i] - F.hidden[i]));
+                        fprintf(stderr, "imi-vp-check: sentence %zu, %zu of %zu English tokens read ahead, largest gap %.3e\n", v_sent, mine ? vp_done : 0, full.size() - h, d);
+                    }
+                    brain.swap_state(VP);   // VP's memory becomes the voice's; the old voice memory is free for the next one
+                    read = false;
+                }
+                vp_sent = -1; vp_bad = false; vp_plan.clear(); vp_done = 0;
+                if (x_busy) vp_begin(x_sent);
+            }
+            tk.begin_sentences(words, sents[v_sent].en, 11 + (unsigned) v_sent, 2000, false, read);
             speaking = true;
+            v_lead = true;
+            v_held.clear();
         };
         // one voice frame; its brain step rides with a text word if one is waiting
         auto voice_frame = [&] {
@@ -313,14 +414,34 @@ int main(int argc, char ** argv) {
             speaking = tk.next(pcm, fb.data());
             sentence & s = sents[v_sent];
             const double made = now();
-            if (pcm.size() > before) {   // place the new samples on the clock as heard
+            std::vector<float> got(pcm.begin() + before, pcm.end());
+            if (!got.empty() && lead_on && v_lead && cursor <= made) {
+                // nothing is playing: hold the quiet start back, begin 60 ms before the first 20 ms over -50 dB
+                v_held.insert(v_held.end(), got.begin(), got.end());
+                size_t first = v_held.size();
+                for (size_t i = 0; i + 480 <= v_held.size(); i += 480) {
+                    double e = 0;
+                    for (size_t j = i; j < i + 480; j++) e += (double) v_held[j] * v_held[j];
+                    if (10 * std::log10(e / 480 + 1e-12) > -50) { first = i; break; }
+                }
+                const size_t keep = 1440;
+                if (first == v_held.size()) {
+                    if (v_held.size() > keep) v_held.erase(v_held.begin(), v_held.end() - keep);
+                    got.clear();
+                } else {
+                    got.assign(v_held.begin() + (first > keep ? first - keep : 0), v_held.end());
+                    v_held.clear();
+                    v_lead = false;
+                }
+            } else if (!got.empty()) v_lead = false;
+            if (!got.empty()) {   // place the new samples on the clock as heard
                 const double play = std::max(made, cursor);
                 if (s.play_start < 0) s.play_start = play;
                 else if (play > cursor + 1e-3) s.gaps++;
                 const size_t at = (size_t) (play * 24000);
-                const size_t n = pcm.size() - before;
+                const size_t n = got.size();
                 if (live.size() < at + n) live.resize(at + n, 0.0f);
-                std::copy(pcm.begin() + before, pcm.end(), live.begin() + at);
+                std::copy(got.begin(), got.end(), live.begin() + at);
                 cursor = play + n / 24000.0;
                 s.play_end = cursor;
             }
@@ -345,6 +466,7 @@ int main(int argc, char ** argv) {
             for (auto & c : kept) n += (int) c.en.size() + (x_open ? 0 : (int) c.ko.size() / 3);
             return n * read_s;
         };
+        static const bool sched_log = getenv("IMI_SCHED_LOG") != nullptr;
         for (;;) {
             const double t = now();
             const bool piece_in = !h_busy && next_piece < pieces.size() && pieces[next_piece].avail <= t;
@@ -356,13 +478,22 @@ int main(int argc, char ** argv) {
             } else if (tr_in && (!speaking || ahead >= translate_est() + margin_s)) {
                 translate_start(); translate_pick();
             } else if (piece_in && (!speaking || ahead >= hear_est() + margin_s)) {
+                if (sched_log) fprintf(stderr, "  sched %.3f hear piece %zu (rows ahead %d)\n", t, next_piece, h_part);
                 hear_start(); hear_pick();
+                if (sched_log) fprintf(stderr, "  sched %.3f  read done\n", now());
             } else if (ahead_rows(t) > 0 && (!speaking || ahead >= 12 * read_s + 0.035 * (t - pieces[next_piece].start) + margin_s)) {
+                if (sched_log) fprintf(stderr, "  sched %.3f ahead piece %zu rows %d..%d\n", t, next_piece, h_part, ahead_rows(t));
                 hear_ahead_step(t);
             } else if (speaking) {
                 voice_frame();
             } else if (x_word >= 0) {
-                const int w = x_word; in(X, [&] { brain.step(w, nullptr, true); }); n_text_alone++; translate_pick();
+                const int w = x_word;
+                if (vp_sent == (int) x_sent && !vp_bad && vp_done < vp_plan.size()) {   // an English word rides into VP
+                    const int32_t vt = vp_plan[vp_done++];
+                    in(X, [&] { brain.step2(w, nullptr, true, VP, vt, nullptr, false); });
+                    n_vp_ride++;
+                } else in(X, [&] { brain.step(w, nullptr, true); });
+                n_text_alone++; translate_pick();
             } else if (h_word >= 0) {
                 const int w = h_word; in(H, [&] { brain.step(w, nullptr, true); }); n_text_alone++; hear_pick();
             } else if (next_piece >= pieces.size() && !h_busy && !x_busy && to_translate.empty() && to_speak.empty()) {
@@ -398,8 +529,8 @@ int main(int argc, char ** argv) {
         std::vector<double> sl = lags;
         std::sort(sl.begin(), sl.end());
         const double med = sl.empty() ? 0 : sl[sl.size() / 2], worst = sl.empty() ? 0 : sl.back();
-        fprintf(stderr, "imi-instant: %s %.1f s of sound, %zu sentences, lag median %.2f s worst %.2f s, %d gaps in speech, busy %.1f s -> %.3f per sound second, speech ends %.1f s after his (ride %d: %d shared, %d text alone, %d voice alone; %d reads ahead)\n",
-                name.c_str(), sound_s, sents.size(), med, worst, gaps, busy, busy / sound_s, cursor - sound_s, ride ? 1 : 0, n_ride, n_text_alone, n_voice_alone, n_ahead);
+        fprintf(stderr, "imi-instant: %s %.1f s of sound, %zu sentences, lag median %.2f s worst %.2f s, %d gaps in speech, busy %.1f s -> %.3f per sound second, speech ends %.1f s after his (ride %d: %d shared, %d text alone, %d voice alone; %d reads ahead; %d English words read ahead)\n",
+                name.c_str(), sound_s, sents.size(), med, worst, gaps, busy, busy / sound_s, cursor - sound_s, ride ? 1 : 0, n_ride, n_text_alone, n_voice_alone, n_ahead, n_vp_ride);
         all_sound += sound_s; all_busy += busy; all_gaps += gaps;
         all_lags.insert(all_lags.end(), lags.begin(), lags.end());
         all_ride += n_ride; all_text_alone += n_text_alone; all_voice_alone += n_voice_alone;

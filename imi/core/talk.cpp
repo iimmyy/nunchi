@@ -11,19 +11,43 @@
 using clk = std::chrono::steady_clock;
 static double ms_since(clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); }
 
+std::string imi_tts_head() {
+    return "<|startoftext|><|im_start|>system\nPerform TTS in American English using a male voice.<|im_end|>\n<|im_start|>user\n";
+}
+
 std::string imi_tts_prompt(const std::string & english) {
-    return "<|startoftext|><|im_start|>system\nPerform TTS in American English using a male voice.<|im_end|>\n<|im_start|>user\n" + english +
-           "<|im_end|>\n<|im_start|>assistant\n<think></think><|audio_start|>";
+    return imi_tts_head() + english + "<|im_end|>\n<|im_start|>assistant\n<think></think><|audio_start|>";
+}
+
+void imi_talker::set_head(const std::vector<int32_t> & ids, const std::vector<std::vector<float>> & conv) {
+    head_ids = ids;
+    head_conv = conv;
+}
+
+void imi_talker::read_fresh(const std::vector<int32_t> & prompt) {
+    const size_t h = head_ids.size();
+    if (h > 0 && prompt.size() > h && std::equal(head_ids.begin(), head_ids.end(), prompt.begin())) {
+        brain.pos = (int) h;
+        brain.conv_state = head_conv;
+        brain.step_batch(prompt.data() + h, nullptr, (int) (prompt.size() - h), false);
+    } else {
+        brain.reset();
+        brain.step_batch(prompt.data(), nullptr, (int) prompt.size(), false);
+    }
 }
 
 void imi_talker::begin(const std::vector<int32_t> & prompt, unsigned seed, int max_fr) {
+    const auto t0 = clk::now();
+    read_fresh(prompt);
+    const double ms = ms_since(t0);
+    start(seed, max_fr);
+    st.prompt_ms = ms;
+}
+
+void imi_talker::start(unsigned seed, int max_fr) {
     st = imi_talk_stats();
     max_frames = max_fr;
-    brain.reset();
     codec.reset();
-    const auto t0 = clk::now();
-    brain.step_batch(prompt.data(), nullptr, (int) prompt.size(), false);
-    st.prompt_ms = ms_since(t0);
     rng.seed(seed);
     hist.clear();
     p.assign(voice.n_vocab, 0.0);
@@ -65,10 +89,11 @@ static int sentence_cap(const std::string & s) {
     return 25 + 10 * n;
 }
 
-void imi_talker::begin_sentences(const imi_words & w, const std::string & english, unsigned seed, int max_fr, bool keep) {
+void imi_talker::begin_sentences(const imi_words & w, const std::string & english, unsigned seed, int max_fr, bool keep, bool read) {
     std::vector<std::string> s = imi_sentences(english);
     if (s.empty()) s.push_back(english);
-    begin(w.encode_prompt(imi_tts_prompt(s[0])), seed, max_fr);
+    if (read) begin(w.encode_prompt(imi_tts_prompt(s[0])), seed, max_fr);
+    else start(seed, max_fr);
     words = &w;
     sents = std::move(s);
     keep_memory = keep;
@@ -88,11 +113,10 @@ void imi_talker::next_sentence() {
         voice.feedback(e.data(), efb.data());
         brain.step(-1, efb.data(), false);
         turn = words->encode_prompt("<|im_end|>\n<|im_start|>user\n" + sents[si] + "<|im_end|>\n<|im_start|>assistant\n<think></think><|audio_start|>");
+        brain.step_batch(turn.data(), nullptr, (int) turn.size(), false);
     } else {
-        brain.reset();
-        turn = words->encode_prompt(imi_tts_prompt(sents[si]));
+        read_fresh(words->encode_prompt(imi_tts_prompt(sents[si])));
     }
-    brain.step_batch(turn.data(), nullptr, (int) turn.size(), false);
     hist.clear();   // the repeat penalty is per answer, as the fork's is per response
     sent_n = 0;
     sent_cap = sentence_cap(sents[si]);

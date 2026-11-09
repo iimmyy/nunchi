@@ -63,6 +63,24 @@ inline std::string imi_ko_piece(std::string ko) {
     return ko;
 }
 
+// a sentence end inside the Korean so far, with more words after it (the hearing sometimes writes nothing for a piece
+// and its words come with the next one, so a sentence end can land mid-text): the byte position just after the first
+// such . ? ! (with any repeats or closing quote), or npos
+inline size_t imi_ko_inner_end(const std::string & ko) {
+    for (size_t i = 0; i < ko.size(); i++) {
+        if (ko[i] != '.' && ko[i] != '?' && ko[i] != '!') continue;
+        size_t j = i + 1;
+        while (j < ko.size() && (ko[j] == '.' || ko[j] == '?' || ko[j] == '!' || ko[j] == '"' || ko[j] == '\'')) j++;
+        if (j >= ko.size() || ko[j] != ' ') continue;
+        size_t k = j;
+        while (k < ko.size() && ko[k] == ' ') k++;
+        if (k >= ko.size()) continue;
+        if (imi_ko_sentence_end(ko.substr(0, j))) return j;
+        i = j - 1;
+    }
+    return std::string::npos;
+}
+
 // translate now? (the sentence so far, its seconds of speech): a sentence end; past 8 s a joining ending; past 12 s anywhere
 inline bool imi_ko_translate_now(const std::string & ko, double secs) {
     return imi_ko_sentence_end(ko) || (secs >= 8 && imi_ko_joining_end(ko)) || secs >= 12;

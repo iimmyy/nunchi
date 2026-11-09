@@ -24,8 +24,10 @@ struct imi_talk_stats {
 // the English cut after . ? ! (with any closing quote or bracket) where a space or the end follows
 std::vector<std::string> imi_sentences(const std::string & english);
 
-// the prompt for English speech in the male voice (the "tts" chat template)
+// the prompt for English speech in the male voice (the "tts" chat template): head + english + tail
 std::string imi_tts_prompt(const std::string & english);
+// its fixed start (system turn and the user turn's opening), the same for every sentence
+std::string imi_tts_head();
 
 // one utterance, a frame at a time, so the caller owns the brain step after each frame (and can share it with
 // another conversation's step, see imi_seoul::step2):
@@ -43,12 +45,23 @@ struct imi_talker {
     // normal pace), whichever comes first.
     // keep_memory false: each sentence starts a fresh voice conversation with its own "tts" prompt instead (the
     // codec keeps streaming either way)
+    // read false: the brain's own memory already holds the first sentence's whole "tts" prompt (read ahead by the
+    // caller), so nothing is reset or read here
     void begin_sentences(const imi_words & words, const std::string & english, unsigned seed, int max_frames = 2000,
-                         bool keep_memory = true);
+                         bool keep_memory = true, bool read = true);
+    // the head (imi_tts_head) is already in the brain's own memory at positions 0..len-1, with the conv memory `conv`
+    // right after it: a fresh sentence goes back there and reads only the rest of its prompt (the same numbers as
+    // reading the whole prompt again, without the head's reading time)
+    void set_head(const std::vector<int32_t> & ids, const std::vector<std::vector<float>> & conv);
     // the next frame's codes from brain.hidden; true: its samples were appended and fb (voice.n_in wide) is the brain's
     // next input; false: speech is over (the codec has been flushed)
     bool next(std::vector<float> & pcm, float * fb);
 private:
+    void start(unsigned seed, int max_frames);
+    // a fresh conversation reads `prompt`: from the head if it starts with it, else from the start
+    void read_fresh(const std::vector<int32_t> & prompt);
+    std::vector<int32_t> head_ids;
+    std::vector<std::vector<float>> head_conv;
     std::mt19937 rng;
     int max_frames = 2000;
     std::vector<int32_t> hist;
