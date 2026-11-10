@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
 #include <immintrin.h>
@@ -46,6 +47,47 @@ inline void axpy_h(float p, const uint16_t * v, float * o, int n) {
 }
 inline float silu(float x) { return x / (1.0f + expf(-x)); }
 const float * f32(const ggml_tensor * t) { return t ? (const float *) t->data : nullptr; }
+
+// Research: IMI_REC=dir writes every table's input rows as 16-bit floats, one file per layer and input
+// (L<layer>.<in|conv_out|attn_out|ffn_in|ffn_down>.f16, rows appended), for one position in IMI_REC_EVERY (default 1).
+// Only thread 0 writes, at points where the rows are complete. Off (the room's case) it costs one test per stop.
+struct recorder {
+    std::string dir;
+    long long every = 1, pos = 0;   // pos: positions this brain has read so far (all calls)
+    std::vector<FILE *> files;      // [layer * 5 + slot]
+    std::vector<uint16_t> buf;
+    static recorder * get() {
+        static recorder * r = [] () -> recorder * {
+            const char * d = getenv("IMI_REC");
+            if (!d || !*d) return nullptr;
+            recorder * x = new recorder;
+            x->dir = d;
+            if (const char * e = getenv("IMI_REC_EVERY")) x->every = std::max(1LL, atoll(e));
+            fprintf(stderr, "imi-seoul: recording table inputs to %s, one position in %lld\n", d, x->every);
+            return x;
+        }();
+        return r;
+    }
+    bool keep(long long p) const { return p % every == 0; }
+    void rows(int il, int slot, const float * x, int dim, int n, size_t ld, long long p0) {
+        static const char * name[5] = { "in", "conv_out", "attn_out", "ffn_in", "ffn_down" };
+        if ((int) files.size() <= il * 5 + slot) files.resize((il + 1) * 5, nullptr);
+        FILE *& f = files[il * 5 + slot];
+        if (!f) {
+            const std::string path = dir + "/L" + std::to_string(il) + "." + name[slot] + ".f16";
+            f = fopen(path.c_str(), "ab");
+            if (!f) { fprintf(stderr, "imi-seoul: cannot write %s\n", path.c_str()); exit(1); }
+        }
+        buf.resize(dim);
+        for (int p = 0; p < n; p++) {
+            if (!keep(p0 + p)) continue;
+            const float * r = x + (size_t) p * ld;
+            for (int i = 0; i < dim; i++) buf[i] = imi_f2h(r[i]);
+            fwrite(buf.data(), sizeof(uint16_t), dim, f);
+        }
+        fflush(f);
+    }
+};
 }
 
 bool imi_seoul::load(const std::string & path, int threads, int ctx_len, imi_team * shared) {
@@ -323,6 +365,8 @@ void imi_seoul::run(int tid, int32_t token, const float * embd, bool want_logits
 
     int c = 0;
     const bool timing = tid == 0;
+    recorder * rc = tid == 0 ? recorder::get() : nullptr;
+    auto rec = [&](int il, int slot, const float * v, int dim) { if (rc) rc->rows(il, slot, v, dim, 1, dim, rc->pos); };
     auto table = [&](const imi_q4 & W, float * out) {
         std::atomic<int> & k = ctr[c++];
         const auto t0 = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
@@ -359,6 +403,7 @@ void imi_seoul::run(int tid, int32_t token, const float * embd, bool want_logits
         const layer & L = layers[il];
         norm_mul(x, L.attn_norm, T.h.data(), E, eps);
         T.qi.from(T.h.data(), E);
+        rec((int) il, 0, T.h.data(), E);
         if (L.conv) {
             table(L.in_proj, bcx.data());
             sync();
@@ -368,6 +413,7 @@ void imi_seoul::run(int tid, int32_t token, const float * embd, bool want_logits
             for (int k = 0; k < d_conv; k++) { const float * sk = st + k * E, * wk = w + k * E; for (int e = 0; e < E; e++) u[e] += sk[e] * wk[e]; }
             for (int e = 0; e < E; e++) u[e] *= cc[e];
             T.qi.from(u, E);
+            rec((int) il, 1, u, E);
             table(L.out_proj, y.data());
             sync();
             if (tid == 0) {   // the conv memory slides one step (every thread has read it by now)
@@ -409,6 +455,7 @@ void imi_seoul::run(int tid, int32_t token, const float * embd, bool want_logits
             if (timing) t_attn += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
             sync();
             T.qi.from(att.data(), n_head * D);
+            rec((int) il, 2, att.data(), n_head * D);
             table(L.o, y.data());
             sync();
         }
@@ -416,9 +463,11 @@ void imi_seoul::run(int tid, int32_t token, const float * embd, bool want_logits
 
         norm_mul(x, L.ffn_norm, T.h.data(), E, eps);
         T.qi.from(T.h.data(), E);
+        rec((int) il, 3, T.h.data(), E);
         table_ffn(L.gate_up, act.data());
         sync();
         T.qi.from(act.data(), n_ff);
+        rec((int) il, 4, act.data(), n_ff);
         table(L.down, fo.data());
         sync();
         imi_norm_mul_add(fo.data(), L.post_ffn_norm, x, E, eps);
@@ -426,6 +475,7 @@ void imi_seoul::run(int tid, int32_t token, const float * embd, bool want_logits
     float * hid = T.h.data();
     norm_mul(x, out_norm, hid, E, eps);
     if (tid == 0) memcpy(hidden.data(), hid, (size_t) E * sizeof(float));
+    if (rc) rc->pos++;
     if (want_logits) {
         T.qk.from(hid, E);
         std::atomic<int> & k = ctr[c++];
@@ -472,6 +522,8 @@ void imi_seoul::run_batch(int tid, const int32_t * tokens, const float * embd, i
     float * X = bX.data(), * H = bH.data(), * Y = bY.data(), * B = bBig.data(), * A = bAct.data();
     int c = 0;
     auto sync = [&] { team->sync(); };
+    recorder * rc = tid == 0 ? recorder::get() : nullptr;   // after the stop that completes the rows, before the next
+    auto rec = [&](int il, int slot, const float * v, int dim, size_t ld) { if (rc) rc->rows(il, slot, v, dim, n, ld, rc->pos); };
     // one table times all n inputs in bq: rows split in chunks of groups
     auto table = [&](const imi_q4 & W, float * o, int ldo) {
         std::atomic<int> & k = ctr[c++];
@@ -503,6 +555,7 @@ void imi_seoul::run_batch(int tid, const int32_t * tokens, const float * embd, i
         sync();
         for (int p = p0; p < p1; p++) { imi_norm_mul(X + (size_t) p * E, L.attn_norm, H + (size_t) p * E, E, eps); bq.set(p, H + (size_t) p * E); }
         sync();
+        rec((int) il, 0, H, E, E);
         if (L.conv) {
             table(L.in_proj, B, 3 * E);
             sync();
@@ -526,6 +579,7 @@ void imi_seoul::run_batch(int tid, const int32_t * tokens, const float * embd, i
             sync();
             for (int p = p0; p < p1; p++) bq.set(p, H + (size_t) p * E);
             sync();
+            rec((int) il, 1, H, E, E);
             table(L.out_proj, Y, E);
             sync();
         } else {
@@ -568,6 +622,7 @@ void imi_seoul::run_batch(int tid, const int32_t * tokens, const float * embd, i
             sync();
             for (int p = p0; p < p1; p++) bq.set(p, H + (size_t) p * (n_head * D));
             sync();
+            rec((int) il, 2, H, n_head * D, (size_t) n_head * D);
             table(L.o, Y, E);
             sync();
         }
@@ -577,12 +632,14 @@ void imi_seoul::run_batch(int tid, const int32_t * tokens, const float * embd, i
             bq.set(p, H + (size_t) p * E);
         }
         sync();
+        rec((int) il, 3, H, E, E);
         table_ffn(L.gate_up, A);
         sync();
         if (tid == 0) bq.shape(n, n_ff);
         sync();
         for (int p = p0; p < p1; p++) bq.set(p, A + (size_t) p * n_ff);
         sync();
+        rec((int) il, 4, A, n_ff, n_ff);
         table(L.down, Y, E);
         sync();
         for (int p = p0; p < p1; p++) imi_norm_mul_add(Y + (size_t) p * E, L.post_ffn_norm, X + (size_t) p * E, E, eps);
@@ -594,6 +651,7 @@ void imi_seoul::run_batch(int tid, const int32_t * tokens, const float * embd, i
         if (hidden_all) memcpy(hidden_all + (size_t) p * E, hp, (size_t) E * sizeof(float));
         if (p == n - 1) memcpy(hidden.data(), hp, (size_t) E * sizeof(float));
     }
+    if (rc) rc->pos += n;
 }
 
 double imi_seoul::bench_tables(int ncol, int reps) {
